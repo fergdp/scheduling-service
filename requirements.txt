@@ -1,0 +1,17 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+gunicorn==23.0.0
+sqlalchemy==2.0.35
+pymysql==1.1.1
+cryptography==43.0.1
+python-jose[cryptography]==3.3.0
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.5.2
+google-api-python-client==2.146.0
+google-auth-oauthlib==1.2.1
+google-auth-httplib2==0.2.0
+slowapi==0.1.9
+bleach==6.1.0
+alembic==1.13.3
+python-multipart==0.0.12
