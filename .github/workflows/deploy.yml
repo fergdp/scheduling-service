@@ -30,10 +30,11 @@ jobs:
           echo "Latest version: $VERSION"
 
       # Paso: Crear artefacto de despliegue (ZIP)
+      # Excluimos .env, venv, pycache y otros archivos que no deben ir a producción
       - name: Create deployment artifact
         id: create_artifact
         run: |
-          zip -r scheduling-service.zip .
+          zip -r scheduling-service.zip . -x "*.env*" -x "venv/*" -x "*/__pycache__/*" -x ".git/*" -x ".github/*" -x "tests/*"
           echo "artifact_path=scheduling-service.zip" >> $GITHUB_OUTPUT
 
       # Paso 1: Copiar el artefacto al VPS usando SCP
