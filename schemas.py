@@ -1,7 +1,7 @@
 from pydantic import BaseModel, ConfigDict
 from datetime import datetime
 from typing import Optional, List
-from .models import AppointmentStatus
+from models import AppointmentStatus
 
 # Base schemas for OAuth
 class OAuthUrlResponse(BaseModel):

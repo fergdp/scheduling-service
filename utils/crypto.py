@@ -15,12 +15,16 @@ cipher_suite = Fernet(FERNET_KEY.encode())
 
 def encrypt_token(token: str) -> str:
     """Encripta un token de texto plano a una cadena de bytes codificada en base64."""
-    if not token:
+    if token is None:
         return None
+    if token == "":
+        return ""
     return cipher_suite.encrypt(token.encode()).decode()
 
 def decrypt_token(encrypted_token: str) -> str:
     """Desencripta un token de una cadena de bytes codificada en base64 a texto plano."""
-    if not encrypted_token:
+    if encrypted_token is None:
         return None
+    if encrypted_token == "":
+        return ""
     return cipher_suite.decrypt(encrypted_token.encode()).decode()

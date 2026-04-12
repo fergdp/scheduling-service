@@ -1,0 +1,69 @@
+# Nombre del Workflow: Despliegue Continuo para el Servicio de Agendamiento
+name: Deploy Scheduling Service
+
+# 1. Disparador (Trigger)
+# Este workflow se ejecuta automáticamente cada vez que se hace un 'push' a la rama 'master'.
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - '**'
+
+# 2. Trabajos (Jobs)
+jobs:
+  deploy-to-vps:
+    runs-on: ubuntu-latest
+
+    # 3. Pasos (Steps)
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get latest tag version
+        id: get_version
+        run: |
+          VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "1.0.0")
+          echo "APP_VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Latest version: $VERSION"
+
+      # Paso: Crear artefacto de despliegue (ZIP)
+      - name: Create deployment artifact
+        id: create_artifact
+        run: |
+          zip -r scheduling-service.zip .
+          echo "artifact_path=scheduling-service.zip" >> $GITHUB_OUTPUT
+
+      # Paso 1: Copiar el artefacto al VPS usando SCP
+      - name: Copy artifact to VPS via SCP
+        uses: appleboy/scp-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          source: "${{ steps.create_artifact.outputs.artifact_path }}"
+          target: "~/temp_deployment"
+
+      # Paso 2: Ejecutar comandos de despliegue en el VPS
+      - name: Execute deployment commands on VPS
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            # Verificar si unzip está instalado
+            if ! command -v unzip &> /dev/null; then
+              echo "unzip no encontrado, instalando..."
+              apt-get update && apt-get install -y unzip
+            fi
+            # Crear el directorio de la aplicación si no existe
+            mkdir -p ~/app/scheduling-service
+            # Descomprimir el artefacto
+            unzip -o ~/temp_deployment/scheduling-service.zip -d ~/app/scheduling-service
+            # Limpiar temporal
+            rm ~/temp_deployment/scheduling-service.zip
+            # Ejecutar el script de despliegue creado por Claude
+            APP_VERSION=${{ env.APP_VERSION }} ~/deploy_scheduling.sh

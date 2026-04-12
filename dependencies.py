@@ -6,13 +6,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from jose import jwt, JWTError
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, with_loader_criteria
 from dotenv import load_dotenv
+from contextvars import ContextVar
 
 load_dotenv()
 
 # Logger configuration
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -33,12 +33,25 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set.")
 
-# SQL Guard Integration point (will be configured in main.py)
+# SQL Guard Context
+current_clinic_id: ContextVar[Optional[int]] = ContextVar("current_clinic_id", default=None)
+
 engine = create_engine(DATABASE_URL, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
     db = SessionLocal()
+    clinic_id = current_clinic_id.get()
+    
+    if clinic_id:
+        # SQL Guard: Inyectar automáticamente el filtro clinic_id en TODAS las consultas
+        db.execute(
+            with_loader_criteria(
+                lambda cls: getattr(cls, "clinic_id", None) == clinic_id,
+                include_subclasses=True
+            )
+        )
+        
     try:
         yield db
     except Exception as e:
@@ -70,7 +83,9 @@ def get_clinic_id(payload: dict = Depends(get_current_user)) -> int:
     if not clinic_id:
         raise HTTPException(status_code=401, detail="Clinic ID not found in token")
 
-    return int(clinic_id)
+    clinic_id_int = int(clinic_id)
+    current_clinic_id.set(clinic_id_int) # Activar el SQL Guard para esta petición
+    return clinic_id_int
 
 def get_user_id(payload: dict = Depends(get_current_user)) -> int:
     if payload is None:

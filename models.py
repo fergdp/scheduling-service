@@ -1,4 +1,4 @@
-from sqlalchemy import Column, BigInteger, String, DateTime, Enum, Text, Boolean, func, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Text, Boolean, func, ForeignKey
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
 from datetime import datetime
@@ -16,9 +16,9 @@ class AppointmentStatus(enum.Enum):
 class DentistCalendarConfig(Base):
     __tablename__ = "dentist_calendar_configs"
 
-    config_id = Column(BigInteger, primary_key=True, autoincrement=True)
-    dentist_user_id = Column(BigInteger, nullable=False, index=True)
-    clinic_id = Column(BigInteger, nullable=False, index=True)
+    config_id = Column(Integer, primary_key=True, autoincrement=True)
+    dentist_user_id = Column(Integer, nullable=False, index=True)
+    clinic_id = Column(Integer, nullable=False, index=True)
     google_email = Column(String(255), nullable=True)
     
     # Encrypted tokens
@@ -38,10 +38,10 @@ class DentistCalendarConfig(Base):
 class Appointment(Base):
     __tablename__ = "appointments"
 
-    appointment_id = Column(BigInteger, primary_key=True, autoincrement=True)
-    clinic_id = Column(BigInteger, nullable=False, index=True)
-    dentist_user_id = Column(BigInteger, nullable=False, index=True)
-    patient_user_id = Column(BigInteger, nullable=False, index=True)
+    appointment_id = Column(Integer, primary_key=True, autoincrement=True)
+    clinic_id = Column(Integer, nullable=False, index=True)
+    dentist_user_id = Column(Integer, nullable=False, index=True)
+    patient_user_id = Column(Integer, nullable=False, index=True)
     
     start_time_utc = Column(DateTime, nullable=False)
     end_time_utc = Column(DateTime, nullable=False)
@@ -59,9 +59,9 @@ class Appointment(Base):
 class AppointmentAuditLog(Base):
     __tablename__ = "appointment_audit_logs"
 
-    log_id = Column(BigInteger, primary_key=True, autoincrement=True)
-    appointment_id = Column(BigInteger, ForeignKey("appointments.appointment_id"), nullable=False)
-    changed_by_user_id = Column(BigInteger, nullable=False)
+    log_id = Column(Integer, primary_key=True, autoincrement=True)
+    appointment_id = Column(Integer, ForeignKey("appointments.appointment_id"), nullable=False)
+    changed_by_user_id = Column(Integer, nullable=False)
     previous_status = Column(String(50))
     new_status = Column(String(50))
     change_reason = Column(Text)

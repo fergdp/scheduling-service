@@ -3,11 +3,11 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from ..dependencies import get_db, get_clinic_id, get_user_id
-from ..models import Appointment, DentistCalendarConfig, AppointmentStatus, AppointmentAuditLog
-from ..schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate
-from ..utils.google_calendar import get_calendar_service, get_free_busy, create_google_event
-from ..utils.crypto import decrypt_token
+from dependencies import get_db, get_clinic_id, get_user_id
+from models import Appointment, DentistCalendarConfig, AppointmentStatus, AppointmentAuditLog
+from schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate
+from utils.google_calendar import get_calendar_service, get_free_busy, create_google_event
+from utils.crypto import decrypt_token
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +19,12 @@ async def get_dentist_availability(
     start: datetime,
     end: datetime,
     db: Session = Depends(get_db),
-    clinic_id: int = Depends(get_clinic_id)
+    clinic_id: int = Depends(get_clinic_id),
+    user_id: int = Depends(get_user_id)
 ):
     """Calcula los huecos libres de un odontólogo uniendo Google + Citas locales."""
+    logger.info(f"Fetching availability for dentist_id: {dentist_id} (clinic_id: {clinic_id}) from {start} to {end} by user: {user_id}")
+    
     # 1. Obtener configuración de Google del odontólogo
     config = db.query(DentistCalendarConfig).filter(
         and_(
@@ -31,18 +34,18 @@ async def get_dentist_availability(
     ).first()
 
     if not config or not config.google_refresh_token:
+        logger.warning(f"Availability request failed: Dentist {dentist_id} has not connected Google Calendar (clinic_id: {clinic_id})")
         raise HTTPException(status_code=400, detail="Dentist has not connected Google Calendar")
 
     try:
         # 2. Consultar Google Free/Busy
-        # Desencriptamos los tokens
         access_token = decrypt_token(config.google_access_token)
         refresh_token = decrypt_token(config.google_refresh_token)
         
         service = get_calendar_service(access_token, refresh_token, config.token_expiry)
         google_busy = get_free_busy(service, "primary", start, end)
 
-        # 3. Consultar Citas locales (Incluso las pendientes de aprobación)
+        # 3. Consultar Citas locales
         local_appointments = db.query(Appointment).filter(
             and_(
                 Appointment.dentist_user_id == dentist_id,
@@ -58,13 +61,13 @@ async def get_dentist_availability(
             for apt in local_appointments
         ]
 
-        # Devolvemos la unión de bloques ocupados
+        logger.info(f"Availability successfully fetched for dentist_id: {dentist_id}. Found {len(google_busy)} Google blocks and {len(local_busy)} local appointments.")
         return {
             "dentist_id": dentist_id,
             "busy_slots": google_busy + local_busy
         }
     except Exception as e:
-        logger.error(f"Error fetching availability: {e}")
+        logger.error(f"Error fetching availability for dentist {dentist_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch availability")
 
 @router.post("/", response_model=AppointmentResponse)
@@ -75,6 +78,8 @@ async def request_appointment(
     patient_id: int = Depends(get_user_id)
 ):
     """Crea una solicitud de turno (Estado: REQUESTED)."""
+    logger.info(f"Requesting new appointment for patient_id: {patient_id} with dentist_id: {apt_data.dentist_user_id} (clinic_id: {clinic_id})")
+    
     new_apt = Appointment(
         clinic_id=clinic_id,
         patient_user_id=patient_id,
@@ -89,6 +94,8 @@ async def request_appointment(
     db.add(new_apt)
     db.commit()
     db.refresh(new_apt)
+    
+    logger.info(f"Appointment request created successfully with id: {new_apt.appointment_id} for patient: {patient_id}")
     return new_apt
 
 @router.patch("/{appointment_id}/status", response_model=AppointmentResponse)
@@ -100,6 +107,8 @@ async def update_appointment_status(
     dentist_id: int = Depends(get_user_id)
 ):
     """Aprueba o rechaza un turno. Si se aprueba, se sincroniza con Google."""
+    logger.info(f"Updating appointment status for id: {appointment_id} to {status_update.status} by user: {dentist_id} (clinic_id: {clinic_id})")
+    
     apt = db.query(Appointment).filter(
         and_(
             Appointment.appointment_id == appointment_id,
@@ -108,14 +117,18 @@ async def update_appointment_status(
     ).first()
 
     if not apt:
+        logger.warning(f"Appointment with id: {appointment_id} not found for clinic_id: {clinic_id}")
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    # Auditoría del cambio
+    # Si es DENTIST, verificar que la cita le pertenece (403 protection)
+    # Nota: Aquí podríamos añadir lógica de RBAC más estricta si fuera necesario
+    # Por ahora registramos la acción.
+
     previous_status = apt.status.value
     apt.status = status_update.status
     
-    # Si se aprueba, impacto en Google Calendar
     if status_update.status == AppointmentStatus.APPROVED:
+        logger.info(f"Appointment {appointment_id} APPROVED. Initiating Google Calendar sync...")
         config = db.query(DentistCalendarConfig).filter(
             and_(
                 DentistCalendarConfig.dentist_user_id == apt.dentist_user_id,
@@ -129,7 +142,6 @@ async def update_appointment_status(
                 refresh_token = decrypt_token(config.google_refresh_token)
                 service = get_calendar_service(access_token, refresh_token, config.token_expiry)
                 
-                # Crear evento en Google
                 event_id = create_google_event(
                     service, 
                     "primary", 
@@ -139,10 +151,9 @@ async def update_appointment_status(
                     f"Cita aprobada desde el portal odontológico. ID: {apt.appointment_id}"
                 )
                 apt.google_event_id = event_id
+                logger.info(f"Google Calendar sync successful for appointment {appointment_id}. Event ID: {event_id}")
             except Exception as e:
-                logger.error(f"Failed to sync with Google: {e}")
-                # Podríamos decidir si fallar o simplemente avisar que no se sincronizó.
-                # Aquí dejaremos que la cita se apruebe localmente de todos modos.
+                logger.error(f"Failed to sync appointment {appointment_id} with Google: {e}")
 
     # Guardar auditoría
     audit = AppointmentAuditLog(
@@ -155,4 +166,6 @@ async def update_appointment_status(
     db.add(audit)
     db.commit()
     db.refresh(apt)
+    
+    logger.info(f"Appointment status for id: {appointment_id} updated successfully from {previous_status} to {apt.status.value}")
     return apt

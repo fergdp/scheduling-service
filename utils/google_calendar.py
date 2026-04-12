@@ -2,7 +2,7 @@ import os
 import logging
 from google_auth_oauthlib.flow import Flow
 from google.oauth2.credentials import Credentials
-from googleapid_client.discovery import build
+from googleapiclient.discovery import build
 from google.auth.transport.requests import Request
 from typing import Dict, Any, Optional
 from datetime import datetime
