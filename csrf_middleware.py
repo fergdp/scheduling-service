@@ -22,7 +22,7 @@ CSRF_COOKIE_CONFIG = {
     "path": "/",
 }
 
-CSRF_EXEMPT_ROUTES = ["/", "/docs", "/redoc", "/openapi.json"]
+CSRF_EXEMPT_ROUTES = ["/", "/docs", "/redoc", "/openapi.json", "/health"]
 CSRF_PROTECTED_METHODS = ["POST", "PUT", "DELETE", "PATCH"]
 
 def generate_csrf_token() -> str:

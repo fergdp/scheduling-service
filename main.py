@@ -115,6 +115,10 @@ app.add_middleware(CSRFMiddleware)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    # Skip verbose logging for health probes to avoid log noise
+    if request.url.path.startswith("/health"):
+        return await call_next(request)
+
     user_id = "anonymous"
     clinic_id = "N/A"
     token = None
@@ -187,8 +191,9 @@ async def root(request: Request):
         "version": os.getenv("APP_VERSION", "1.0.0")
     }
 
-# Router inclusion
-from routers import oauth, appointments
+# Router inclusion — health must be first (no rate limiter, no auth)
+from routers import oauth, appointments, health as health_router
+app.include_router(health_router.router)
 app.include_router(oauth.router, prefix="/clinic-scheduling-api/v1/oauth", tags=["OAuth"])
 app.include_router(appointments.router, prefix="/clinic-scheduling-api/v1/appointments", tags=["Appointments"])
 
