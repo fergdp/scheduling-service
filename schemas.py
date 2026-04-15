@@ -77,3 +77,7 @@ class AppointmentResponse(AppointmentBase):
 class AppointmentStatusUpdate(BaseModel):
     status: AppointmentStatus
     change_reason: Optional[str] = None
+
+class AppointmentListResponse(BaseModel):
+    appointments: list[AppointmentResponse]
+    total: int

@@ -7,7 +7,7 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from dependencies import get_db, get_clinic_id, get_user_id, get_roles
 from models import Appointment, DentistCalendarConfig, AppointmentStatus, AppointmentAuditLog
-from schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate
+from schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate, AppointmentListResponse
 from utils.google_calendar import get_calendar_service, get_free_busy, create_google_event
 from utils.crypto import decrypt_token
 
@@ -74,6 +74,53 @@ async def get_dentist_availability(
     except Exception as e:
         logger.error(f"Error fetching availability for dentist {dentist_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to fetch availability")
+
+@router.get("/", response_model=AppointmentListResponse)
+@limiter.limit("60/minute")
+async def list_appointments(
+    request: Request,
+    db: Session = Depends(get_db),
+    clinic_id: int = Depends(get_clinic_id),
+    user_id: int = Depends(get_user_id),
+    roles: list[str] = Depends(get_roles),
+    status: AppointmentStatus = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Lista turnos filtrados por rol:
+    - ADMIN: todos los turnos de la clínica.
+    - DENTIST: solo los turnos asignados a él.
+    - PATIENT: solo sus propios turnos.
+    """
+    logger.info(f"Listing appointments for user {user_id} roles={roles} (clinic {clinic_id})")
+
+    filters = [Appointment.clinic_id == clinic_id]
+
+    is_admin = "ADMIN" in roles
+    is_dentist = "DENTIST" in roles
+
+    if not is_admin:
+        if is_dentist:
+            filters.append(Appointment.dentist_user_id == user_id)
+        else:
+            # PATIENT o RECEPTIONIST: solo los suyos como paciente
+            filters.append(Appointment.patient_user_id == user_id)
+
+    if status:
+        filters.append(Appointment.status == status)
+
+    query = db.query(Appointment).filter(and_(*filters))
+    total = query.count()
+    appointments = (
+        query.order_by(Appointment.start_time_utc.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+
+    logger.info(f"Returning {len(appointments)} of {total} appointments for user {user_id}")
+    return {"appointments": appointments, "total": total}
+
 
 @router.post("/", response_model=AppointmentResponse)
 @limiter.limit("10/minute")

@@ -23,6 +23,56 @@ def create_appointment(client, dentist_user_id=1, days_ahead=1):
 
 
 # ---------------------------------------------------------------------------
+# Tests de listado
+# ---------------------------------------------------------------------------
+
+def test_list_appointments_admin_sees_all(client):
+    """ADMIN ve todos los turnos de la clínica."""
+    create_appointment(client, dentist_user_id=1, days_ahead=1)
+    create_appointment(client, dentist_user_id=2, days_ahead=2)
+    res = client.get("/clinic-scheduling-api/v1/appointments/")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total"] == 2
+    assert len(data["appointments"]) == 2
+
+
+def test_list_appointments_dentist_sees_own(client, other_dentist_client):
+    """Dentista solo ve sus propios turnos."""
+    # client es user_id=1 DENTIST+ADMIN, crea un turno para dentist 1
+    create_appointment(client, dentist_user_id=1, days_ahead=1)
+    # other_dentist es user_id=99 DENTIST, no debería ver ese turno
+    res = other_dentist_client.get("/clinic-scheduling-api/v1/appointments/")
+    assert res.status_code == 200
+    assert res.json()["total"] == 0
+
+
+def test_list_appointments_filter_by_status(client):
+    """Filtrar por status devuelve solo los turnos en ese estado."""
+    apt_id = create_appointment(client, dentist_user_id=1, days_ahead=1)
+    create_appointment(client, dentist_user_id=1, days_ahead=2)
+    # Aprobar uno
+    client.patch(f"/clinic-scheduling-api/v1/appointments/{apt_id}/status", json={"status": "APPROVED"})
+    res = client.get("/clinic-scheduling-api/v1/appointments/?status=APPROVED")
+    assert res.status_code == 200
+    data = res.json()
+    assert data["total"] == 1
+    assert data["appointments"][0]["status"] == "APPROVED"
+
+
+def test_list_appointments_patient_sees_own(patient_client):
+    """PATIENT solo ve sus propios turnos."""
+    start, end = future_slot(days_ahead=3)
+    patient_client.post(
+        "/clinic-scheduling-api/v1/appointments/",
+        json={"dentist_user_id": 1, "start_time_utc": start, "end_time_utc": end}
+    )
+    res = patient_client.get("/clinic-scheduling-api/v1/appointments/")
+    assert res.status_code == 200
+    assert res.json()["total"] == 1
+
+
+# ---------------------------------------------------------------------------
 # Tests originales
 # ---------------------------------------------------------------------------
 
