@@ -2,7 +2,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 import os
-from dependencies import get_db, get_clinic_id, get_user_id
+from dependencies import get_db, get_clinic_id, get_user_id, require_any_role
 from utils.google_calendar import get_google_auth_url, exchange_code_for_tokens, get_google_user_email
 from utils.crypto import encrypt_token
 from models import DentistCalendarConfig
@@ -17,7 +17,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 
 router = APIRouter()
 
-@router.get("/url", response_model=OAuthUrlResponse)
+@router.get("/url", response_model=OAuthUrlResponse, dependencies=[require_any_role("DENTIST", "ADMIN")])
 async def get_auth_url(
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
@@ -32,7 +32,7 @@ async def get_auth_url(
         logger.error(f"Error generating OAuth URL for dentist {user_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to generate authorization URL")
 
-@router.get("/callback")
+@router.get("/callback", dependencies=[require_any_role("DENTIST", "ADMIN")])
 async def oauth_callback(
     code: str = Query(...),
     db: Session = Depends(get_db),

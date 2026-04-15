@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from dependencies import get_db, get_clinic_id, get_user_id
+from dependencies import get_db, get_clinic_id, get_user_id, get_roles
 from models import Appointment, DentistCalendarConfig, AppointmentStatus, AppointmentAuditLog
 from schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate
 from utils.google_calendar import get_calendar_service, get_free_busy, create_google_event
@@ -113,11 +113,17 @@ async def update_appointment_status(
     status_update: AppointmentStatusUpdate,
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
-    dentist_id: int = Depends(get_user_id)
+    user_id: int = Depends(get_user_id),
+    roles: list[str] = Depends(get_roles)
 ):
-    """Aprueba o rechaza un turno. Si se aprueba, se sincroniza con Google."""
-    logger.info(f"Updating appointment status for id: {appointment_id} to {status_update.status} by user: {dentist_id} (clinic_id: {clinic_id})")
-    
+    """Aprueba, rechaza o cancela un turno con control de roles.
+
+    Reglas de acceso:
+    - APPROVED / REJECTED / COMPLETED: solo el dentista asignado o un ADMIN.
+    - CANCELLED: el paciente dueño del turno, el dentista asignado, o un ADMIN.
+    """
+    logger.info(f"Updating appointment {appointment_id} to {status_update.status} by user {user_id} roles={roles} (clinic {clinic_id})")
+
     apt = db.query(Appointment).filter(
         and_(
             Appointment.appointment_id == appointment_id,
@@ -126,12 +132,58 @@ async def update_appointment_status(
     ).first()
 
     if not apt:
-        logger.warning(f"Appointment with id: {appointment_id} not found for clinic_id: {clinic_id}")
+        logger.warning(f"Appointment {appointment_id} not found for clinic {clinic_id}")
         raise HTTPException(status_code=404, detail="Appointment not found")
 
-    # Si es DENTIST, verificar que la cita le pertenece (403 protection)
-    # Nota: Aquí podríamos añadir lógica de RBAC más estricta si fuera necesario
-    # Por ahora registramos la acción.
+    # --- Validación de transición de estado ---
+    ALLOWED_TRANSITIONS = {
+        AppointmentStatus.REQUESTED: {AppointmentStatus.APPROVED, AppointmentStatus.REJECTED, AppointmentStatus.CANCELLED},
+        AppointmentStatus.APPROVED:  {AppointmentStatus.COMPLETED, AppointmentStatus.CANCELLED},
+        AppointmentStatus.REJECTED:  set(),
+        AppointmentStatus.COMPLETED: set(),
+        AppointmentStatus.CANCELLED: set(),
+    }
+    if status_update.status not in ALLOWED_TRANSITIONS.get(apt.status, set()):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Cannot transition from {apt.status.value} to {status_update.status.value}"
+        )
+
+    # --- RBAC ---
+    is_admin    = "ADMIN" in roles
+    is_dentist  = "DENTIST" in roles
+    is_patient  = "PATIENT" in roles
+
+    if status_update.status in (
+        AppointmentStatus.APPROVED,
+        AppointmentStatus.REJECTED,
+        AppointmentStatus.COMPLETED
+    ):
+        # Solo el dentista asignado a este turno, o un admin
+        if not is_admin and not (is_dentist and apt.dentist_user_id == user_id):
+            logger.warning(
+                f"Forbidden: user {user_id} (roles={roles}) tried to {status_update.status.value} "
+                f"appointment {appointment_id} assigned to dentist {apt.dentist_user_id}"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="Only the assigned dentist or an admin can approve, reject or complete appointments"
+            )
+
+    elif status_update.status == AppointmentStatus.CANCELLED:
+        # El paciente puede cancelar su propio turno; el dentista asignado también; admin siempre
+        is_own_patient = is_patient and apt.patient_user_id == user_id
+        is_own_dentist = is_dentist and apt.dentist_user_id == user_id
+        if not is_admin and not is_own_patient and not is_own_dentist:
+            logger.warning(
+                f"Forbidden: user {user_id} (roles={roles}) tried to cancel appointment {appointment_id} "
+                f"(patient={apt.patient_user_id}, dentist={apt.dentist_user_id})"
+            )
+            raise HTTPException(
+                status_code=403,
+                detail="You can only cancel your own appointments"
+            )
+    # --- fin RBAC ---
 
     previous_status = apt.status.value
     apt.status = status_update.status
@@ -167,7 +219,7 @@ async def update_appointment_status(
     # Guardar auditoría
     audit = AppointmentAuditLog(
         appointment_id=apt.appointment_id,
-        changed_by_user_id=dentist_id,
+        changed_by_user_id=user_id,
         previous_status=previous_status,
         new_status=status_update.status.value,
         change_reason=status_update.change_reason

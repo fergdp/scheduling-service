@@ -90,9 +90,33 @@ def get_clinic_id(payload: dict = Depends(get_current_user)) -> int:
 def get_user_id(payload: dict = Depends(get_current_user)) -> int:
     if payload is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
-    
+
     user_id = payload.get("user_id")
     if not user_id:
         raise HTTPException(status_code=401, detail="User ID not found in token")
-    
+
     return int(user_id)
+
+def get_roles(payload: Optional[dict] = Depends(get_current_user)) -> list[str]:
+    """Extrae los roles del JWT y los normaliza a mayúsculas. Ej: ['DENTIST', 'ADMIN']"""
+    if payload is None:
+        return []
+    return [r.upper() for r in payload.get("roles", [])]
+
+def require_any_role(*allowed_roles: str):
+    """
+    Factory de dependencia: lanza 403 si el usuario no tiene ninguno de los roles requeridos.
+
+    Uso:
+        @router.get("/url", dependencies=[require_any_role("DENTIST", "ADMIN")])
+        async def my_endpoint(...):
+    """
+    def _check(roles: list[str] = Depends(get_roles)) -> list[str]:
+        normalized = {r.upper() for r in allowed_roles}
+        if not any(r in normalized for r in roles):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Access denied. Required: {' or '.join(allowed_roles)}"
+            )
+        return roles
+    return Depends(_check)

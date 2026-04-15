@@ -31,13 +31,48 @@ def override_get_current_user():
 @pytest.fixture(autouse=True)
 def setup_database():
     Base.metadata.create_all(bind=engine)
+    # Reset rate limiter counters so each test starts from zero
+    from routers.appointments import limiter as apts_limiter
+    from main import limiter as main_limiter
+    apts_limiter._storage.reset()
+    main_limiter._storage.reset()
     yield
     Base.metadata.drop_all(bind=engine)
 
+def _make_client(user_override):
+    """
+    Helper que crea un TestClient con las dependency overrides dadas
+    y las restaura al estado previo al salir — no llama a .clear() global
+    para no interferir con otros fixtures activos en el mismo test.
+    """
+    previous = app.dependency_overrides.copy()
+    app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_current_user] = user_override
+    try:
+        with TestClient(app) as c:
+            yield c
+    finally:
+        app.dependency_overrides.clear()
+        app.dependency_overrides.update(previous)
+
+
 @pytest.fixture
 def client():
-    app.dependency_overrides[get_db] = override_get_db
-    app.dependency_overrides[get_current_user] = override_get_current_user
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+    """Usuario DENTIST + ADMIN (user_id=1). Fixture principal de tests."""
+    yield from _make_client(override_get_current_user)
+
+
+@pytest.fixture
+def patient_client():
+    """Usuario PATIENT (user_id=10)."""
+    def _patient():
+        return {"user_id": 10, "clinic_id": 1, "roles": ["PATIENT"]}
+    yield from _make_client(_patient)
+
+
+@pytest.fixture
+def other_dentist_client():
+    """Dentista diferente al asignado al turno (user_id=99)."""
+    def _dentist():
+        return {"user_id": 99, "clinic_id": 1, "roles": ["DENTIST"]}
+    yield from _make_client(_dentist)
