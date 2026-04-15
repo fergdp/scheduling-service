@@ -21,6 +21,8 @@ venv/
 *.swp
 .DS_Store
 .env
+.env.*
+!.env.example
 .idea/
 .pytest_cache/
 .coverage

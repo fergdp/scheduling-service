@@ -1,8 +1,10 @@
 import logging
 from datetime import datetime, timedelta
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from dependencies import get_db, get_clinic_id, get_user_id
 from models import Appointment, DentistCalendarConfig, AppointmentStatus, AppointmentAuditLog
 from schemas import AppointmentCreate, AppointmentResponse, AppointmentStatusUpdate
@@ -12,9 +14,12 @@ from utils.crypto import decrypt_token
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 @router.get("/availability/dentist/{dentist_id}")
+@limiter.limit("30/minute")
 async def get_dentist_availability(
+    request: Request,
     dentist_id: int,
     start: datetime,
     end: datetime,
@@ -71,7 +76,9 @@ async def get_dentist_availability(
         raise HTTPException(status_code=500, detail="Failed to fetch availability")
 
 @router.post("/", response_model=AppointmentResponse)
+@limiter.limit("10/minute")
 async def request_appointment(
+    request: Request,
     apt_data: AppointmentCreate,
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
@@ -99,7 +106,9 @@ async def request_appointment(
     return new_apt
 
 @router.patch("/{appointment_id}/status", response_model=AppointmentResponse)
+@limiter.limit("20/minute")
 async def update_appointment_status(
+    request: Request,
     appointment_id: int,
     status_update: AppointmentStatusUpdate,
     db: Session = Depends(get_db),
