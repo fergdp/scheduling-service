@@ -49,9 +49,14 @@ class AppointmentCreate(AppointmentBase):
 
     @model_validator(mode="after")
     def end_must_be_after_start(self) -> "AppointmentCreate":
-        if self.start_time_utc >= self.end_time_utc:
+        # Normalizar end a UTC-aware para comparar con start (que ya fue normalizado)
+        end = self.end_time_utc
+        end_aware = end if end.tzinfo is not None else end.replace(tzinfo=timezone.utc)
+        self.end_time_utc = end_aware
+
+        if self.start_time_utc >= end_aware:
             raise ValueError("end_time_utc must be after start_time_utc")
-        duration = self.end_time_utc - self.start_time_utc
+        duration = end_aware - self.start_time_utc
         if duration.total_seconds() < 900:  # 15 minutos mínimo
             raise ValueError("Appointment duration must be at least 15 minutes")
         if duration.total_seconds() > 28800:  # 8 horas máximo
