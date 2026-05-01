@@ -266,6 +266,8 @@ async def list_appointments(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     patient_user_id: Optional[int] = Query(None),
+    date_from: Optional[datetime] = Query(None),
+    date_to: Optional[datetime] = Query(None),
 ):
     """
     Lista turnos de la clínica con filtros opcionales.
@@ -277,19 +279,30 @@ async def list_appointments(
     if patient_user_id and any(r in roles for r in ("ADMIN", "DENTIST", "RECEPTIONIST")):
         # Contexto historia clínica: mostrar todos los turnos del paciente en la clínica
         filters.append(Appointment.patient_user_id == patient_user_id)
-    elif "ADMIN" not in roles:
+    elif "ADMIN" not in roles and "RECEPTIONIST" not in roles:
         if "DENTIST" in roles:
             filters.append(Appointment.dentist_user_id == user_id)
         else:
+            # PATIENT: solo sus propios turnos
             filters.append(Appointment.patient_user_id == user_id)
 
+    if date_from:
+        filters.append(Appointment.start_time_utc >= _naive(date_from))
+    if date_to:
+        filters.append(Appointment.start_time_utc < _naive(date_to))
     if status:
         filters.append(Appointment.status == status)
 
     query = db.query(Appointment).filter(and_(*filters))
     total = query.count()
+    # Orden ascendente cuando se filtra por fecha (agenda del día); descendente por defecto (historial)
+    order = (
+        Appointment.start_time_utc.asc()
+        if date_from is not None
+        else Appointment.start_time_utc.desc()
+    )
     appointments = (
-        query.order_by(Appointment.start_time_utc.desc())
+        query.order_by(order)
         .offset(offset).limit(limit).all()
     )
     return {"appointments": appointments, "total": total}
