@@ -49,8 +49,12 @@ def get_db():
     try:
         yield db
     except Exception:
-        logger.exception("Database connection error")
-        raise HTTPException(status_code=500, detail="Database connection error")
+        # Rollback explícito para evitar que la transacción quede abierta y
+        # bloquee filas hasta que el pool resetee la conexión. Re-raise la
+        # excepción original — no la envolvemos en HTTP 500 para no tragar
+        # HTTPException(404/403/422/etc.) que los endpoints lanzan legítimamente.
+        db.rollback()
+        raise
     finally:
         db.close()
 

@@ -74,6 +74,11 @@ def get_calendar_service(access_token: str, refresh_token: str, token_expiry: da
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
+        # Si por algún motivo el refresh deja las credenciales inválidas (token
+        # vacío, sin expiry, etc.) preferimos fallar acá antes que llamar a la
+        # API con un token roto y obtener errores opacos más adelante.
+        if not creds.valid:
+            raise RuntimeError("Google Calendar credentials invalid after refresh")
     return build("calendar", "v3", credentials=creds)
 
 
@@ -84,7 +89,15 @@ def get_free_busy(service, calendar_id: str, start_time: datetime, end_time: dat
         "items": [{"id": calendar_id}]
     }
     query = service.freebusy().query(body=body).execute()
-    return query.get("calendars", {}).get(calendar_id, {}).get("busy", [])
+    calendar_data = query.get("calendars", {}).get(calendar_id, {})
+    # Google freebusy puede responder 200 OK con un campo "errors" para un
+    # calendario específico (rate limit, calendario inaccesible, etc.) y
+    # "busy" vacío. Si retornáramos [] en ese caso, el paciente vería slots
+    # libres que en realidad están ocupados — preferimos fallar ruidoso.
+    errors = calendar_data.get("errors")
+    if errors:
+        raise RuntimeError(f"Google Calendar freebusy errors for {calendar_id}: {errors}")
+    return calendar_data.get("busy", [])
 
 
 def create_google_event(
