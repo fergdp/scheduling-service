@@ -1,10 +1,11 @@
 import logging
-import secrets
 import os
+from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Cookie
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from typing import Optional
+from jose import jwt, JWTError
 from dependencies import get_db, get_clinic_id, get_user_id, require_any_role
 from utils.google_calendar import get_google_auth_url, exchange_code_for_tokens, get_google_user_email
 from utils.crypto import encrypt_token
@@ -14,12 +15,40 @@ from google.oauth2.credentials import Credentials
 
 logger = logging.getLogger(__name__)
 
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_ID  = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-_IS_PRODUCTION = os.getenv("APP_ENVIRONMENT", "development").lower() == "production"
+_IS_PRODUCTION    = os.getenv("APP_ENVIRONMENT", "development").lower() == "production"
 _OAUTH_STATE_COOKIE = "oauth_state"
+_ALGORITHM        = "HS256"
+_STATE_TTL_MINUTES = 10
+
+SECRET_KEY_RAW = os.getenv("JWT_SECRET_KEY", "")
+try:
+    import base64
+    _SECRET_BYTES = base64.b64decode(SECRET_KEY_RAW)
+except Exception:
+    _SECRET_BYTES = SECRET_KEY_RAW.encode()
 
 router = APIRouter()
+
+
+def _make_state_jwt(user_id: int, clinic_id: int) -> str:
+    """Genera un JWT corto con identidad del dentista para usar como state de OAuth."""
+    exp = datetime.now(timezone.utc) + timedelta(minutes=_STATE_TTL_MINUTES)
+    return jwt.encode(
+        {"user_id": user_id, "clinic_id": clinic_id, "exp": exp},
+        _SECRET_BYTES,
+        algorithm=_ALGORITHM,
+    )
+
+
+def _decode_state_jwt(state: str) -> dict:
+    """Valida firma y expiración del state JWT. Lanza HTTPException si es inválido."""
+    try:
+        return jwt.decode(state, _SECRET_BYTES, algorithms=[_ALGORITHM])
+    except JWTError as e:
+        logger.warning(f"Invalid OAuth state JWT: {e}")
+        raise HTTPException(status_code=400, detail="Invalid OAuth state — possible CSRF attack")
 
 
 @router.get("/status", dependencies=[require_any_role("DENTIST", "ADMIN")])
@@ -28,7 +57,6 @@ async def get_gcal_status(
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
 ):
-    """Devuelve si el odontólogo tiene Google Calendar conectado."""
     config = db.query(DentistCalendarConfig).filter(
         DentistCalendarConfig.dentist_user_id == user_id,
         DentistCalendarConfig.clinic_id == clinic_id
@@ -47,7 +75,6 @@ async def disconnect_gcal(
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
 ):
-    """Desvincula la cuenta de Google Calendar del odontólogo."""
     config = db.query(DentistCalendarConfig).filter(
         DentistCalendarConfig.dentist_user_id == user_id,
         DentistCalendarConfig.clinic_id == clinic_id
@@ -69,17 +96,22 @@ async def get_auth_url(
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
 ):
-    """Genera la URL de Google OAuth para que el odontólogo vincule su cuenta."""
+    """
+    Genera la URL de Google OAuth. El state es un JWT corto firmado con
+    user_id + clinic_id para que el callback (público) pueda identificar al dentista
+    sin depender de la cookie de sesión, que no llega en redirects top-level.
+    """
     logger.info(f"Generating Google OAuth URL for dentist_id: {user_id} (clinic_id: {clinic_id})")
     try:
-        state = secrets.token_urlsafe(32)
+        state = _make_state_jwt(user_id, clinic_id)
         auth_url = get_google_auth_url(state)
 
-        # State almacenado en cookie httpOnly de corta vida para validar en el callback (anti-CSRF).
+        # Guardamos el mismo JWT en cookie httpOnly (samesite=lax sobrevive el redirect top-level).
+        # En /callback comparamos cookie vs query-param como defensa en profundidad.
         response.set_cookie(
             key=_OAUTH_STATE_COOKIE,
             value=state,
-            max_age=600,
+            max_age=_STATE_TTL_MINUTES * 60,
             httponly=True,
             secure=_IS_PRODUCTION,
             samesite="lax",
@@ -93,37 +125,36 @@ async def get_auth_url(
         raise HTTPException(status_code=500, detail="Failed to generate authorization URL")
 
 
-@router.get("/callback", dependencies=[require_any_role("DENTIST", "ADMIN")])
+# Callback es PÚBLICO — el redirect de Google es top-level y no envía la cookie
+# de sesión httpOnly. La identidad del dentista viene del state JWT firmado.
+@router.get("/callback")
 async def oauth_callback(
     response: Response,
     code: str = Query(...),
     state: str = Query(...),
     stored_state: Optional[str] = Cookie(None, alias=_OAUTH_STATE_COOKIE),
     db: Session = Depends(get_db),
-    user_id: int = Depends(get_user_id),
-    clinic_id: int = Depends(get_clinic_id)
 ):
     """
-    Callback de Google que recibe el código, lo intercambia por tokens
-    y los vincula permanentemente al odontólogo en la base de datos.
+    Callback de Google. Valida el state JWT (firma + expiración) y lo compara
+    con la cookie oauth_state como segunda línea de defensa anti-CSRF.
     """
-    # Validar state para prevenir CSRF en el flujo OAuth2
-    if not stored_state or not secrets.compare_digest(state, stored_state):
-        logger.warning(
-            f"OAuth state mismatch for user {user_id}: "
-            f"expected={stored_state!r} got={state!r}"
-        )
+    # 1. Validar firma y expiración del state JWT → extrae identidad
+    payload = _decode_state_jwt(state)
+    user_id  = payload["user_id"]
+    clinic_id = payload["clinic_id"]
+
+    # 2. Defensa en profundidad: comparar query-param vs cookie (double-submit)
+    if stored_state and stored_state != state:
+        logger.warning(f"OAuth state cookie mismatch for user {user_id}")
         raise HTTPException(status_code=400, detail="Invalid OAuth state — possible CSRF attack")
 
-    # Invalidar la cookie de state (token de un solo uso)
     response.delete_cookie(key=_OAUTH_STATE_COOKIE, path="/")
-
     logger.info(f"Received Google OAuth callback for user_id: {user_id} (clinic_id: {clinic_id})")
+
     try:
-        # 1. Intercambiar código por tokens
         tokens = exchange_code_for_tokens(code)
 
-        # 2. Obtener el email de Google para registro visual
         creds = Credentials(
             token=tokens["access_token"],
             refresh_token=tokens["refresh_token"],
@@ -134,30 +165,24 @@ async def oauth_callback(
         google_email = get_google_user_email(creds)
         logger.info(f"OAuth tokens obtained for Google account: {google_email} (dentist_id: {user_id})")
 
-        # 3. Encriptar los tokens para seguridad "at-rest"
-        encrypted_access = encrypt_token(tokens["access_token"])
+        encrypted_access  = encrypt_token(tokens["access_token"])
         encrypted_refresh = encrypt_token(tokens["refresh_token"])
-        token_expiry = tokens["token_expiry"]
+        token_expiry      = tokens["token_expiry"]
 
-        # 4. Vincular con el odontólogo en la base de datos
         config = db.query(DentistCalendarConfig).filter(
             DentistCalendarConfig.dentist_user_id == user_id,
             DentistCalendarConfig.clinic_id == clinic_id
         ).first()
 
         if not config:
-            config = DentistCalendarConfig(
-                dentist_user_id=user_id,
-                clinic_id=clinic_id
-            )
+            config = DentistCalendarConfig(dentist_user_id=user_id, clinic_id=clinic_id)
             db.add(config)
 
-        config.google_access_token = encrypted_access
+        config.google_access_token  = encrypted_access
         config.google_refresh_token = encrypted_refresh
-        config.token_expiry = token_expiry
-        config.google_email = google_email
-        config.sync_enabled = True
-
+        config.token_expiry         = token_expiry
+        config.google_email         = google_email
+        config.sync_enabled         = True
         db.commit()
 
         logger.info(f"Successfully linked Google account {google_email} for dentist {user_id} in clinic {clinic_id}")
