@@ -6,7 +6,7 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from jose import jwt, JWTError
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session, with_loader_criteria
+from sqlalchemy.orm import sessionmaker, Session
 from dotenv import load_dotenv
 from contextvars import ContextVar
 
@@ -40,21 +40,15 @@ engine = create_engine(DATABASE_URL, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
+    # Multi-tenancy: NO hay SQL Guard automático.
+    # Cada endpoint es responsable de filtrar explícitamente por clinic_id
+    # (e.g. Appointment.clinic_id == clinic_id).
+    # El valor de current_clinic_id se usa como referencia en los endpoints
+    # pero no aplica filtros a nivel de sesión.
     db = SessionLocal()
-    clinic_id = current_clinic_id.get()
-    
-    if clinic_id:
-        # SQL Guard: Inyectar automáticamente el filtro clinic_id en TODAS las consultas
-        db.execute(
-            with_loader_criteria(
-                lambda cls: getattr(cls, "clinic_id", None) == clinic_id,
-                include_subclasses=True
-            )
-        )
-        
     try:
         yield db
-    except Exception as e:
+    except Exception:
         logger.exception("Database connection error")
         raise HTTPException(status_code=500, detail="Database connection error")
     finally:
@@ -98,10 +92,13 @@ def get_user_id(payload: dict = Depends(get_current_user)) -> int:
     return int(user_id)
 
 def get_roles(payload: Optional[dict] = Depends(get_current_user)) -> list[str]:
-    """Extrae los roles del JWT y los normaliza a mayúsculas. Ej: ['DENTIST', 'ADMIN']"""
+    """Extrae los roles del JWT, quita el prefijo ROLE_ y normaliza a mayúsculas.
+    Spring Boot emite 'ROLE_ADMIN', 'ROLE_DENTIST', etc.
+    Este servicio trabaja con 'ADMIN', 'DENTIST', etc.
+    """
     if payload is None:
         return []
-    return [r.upper() for r in payload.get("roles", [])]
+    return [r.upper().removeprefix("ROLE_") for r in payload.get("roles", [])]
 
 def require_any_role(*allowed_roles: str):
     """

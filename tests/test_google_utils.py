@@ -4,11 +4,12 @@ from datetime import datetime
 from utils.google_calendar import get_google_auth_url, exchange_code_for_tokens, get_google_user_email
 
 def test_get_google_auth_url():
-    """Verifica que la URL generada contenga los parámetros necesarios."""
-    url = get_google_auth_url()
+    """Verifica que la URL generada contenga los parámetros necesarios, incluido el state."""
+    url = get_google_auth_url("test_state_value")
     assert "access_type=offline" in url
     assert "response_type=code" in url
     assert "scope=" in url
+    assert "state=test_state_value" in url
 
 @patch("utils.google_calendar.Flow.from_client_config")
 def test_exchange_code_success(mock_flow_init):

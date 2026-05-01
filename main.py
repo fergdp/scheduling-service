@@ -92,6 +92,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # CORS Configuration
 origins = [
     "http://localhost:3000",
+    "http://localhost:3001",
     "https://atuconsul.com",
     "https://www.atuconsul.com"
 ]

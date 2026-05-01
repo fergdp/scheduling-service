@@ -28,18 +28,25 @@ source "$VENV_NAME/bin/activate"
 # 2. Dependencias
 pip install -r requirements.txt
 
-# 3. MIGRACIONES AUTOMÁTICAS (La magia de Alembic)
+# 3. TESTS Y COBERTURA — bloquea deploy si fallan o cobertura < 80%
+echo "Ejecutando tests con cobertura..."
+python -m pytest tests/ --cov=. --cov-config=.coveragerc -q || {
+    echo "Error: Tests fallidos o cobertura insuficiente. Deploy cancelado."
+    exit 1
+}
+
+# 5. MIGRACIONES AUTOMÁTICAS (La magia de Alembic)
 echo "Aplicando migraciones automáticas a la base de datos..."
 alembic upgrade head || { echo "Error: Fallaron las migraciones."; exit 1; }
 
-# 4. Detener servicio
+# 6. Detener servicio
 sudo supervisorctl stop scheduling-service || true
 sleep 5
 
-# 5. Actualizar Configuración (Actualiza APP_VERSION y mantiene las otras)
+# 7. Actualizar Configuración (Actualiza APP_VERSION y mantiene las otras)
 sudo sed -i -E "s/(APP_VERSION=\")[^\"]*(\")/\1$APP_VERSION\2/" "$SUPERVISOR_CONF_FILE"
 
-# 6. Reiniciar Servicio
+# 8. Reiniciar Servicio
 sudo supervisorctl reread
 sudo supervisorctl update
 sudo supervisorctl start scheduling-service || exit 1

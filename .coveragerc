@@ -1,0 +1,12 @@
+[run]
+source = .
+omit =
+    venv/*
+    alembic/*
+    tests/*
+    main.py
+    deploy_scheduling_service.sh
+
+[report]
+show_missing = True
+fail_under = 80
