@@ -264,11 +264,19 @@ async def list_appointments(
     status: AppointmentStatus = Query(None),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
+    patient_user_id: Optional[int] = Query(None),
 ):
-    """Lista turnos de la clínica con filtros opcionales."""
+    """
+    Lista turnos de la clínica con filtros opcionales.
+    patient_user_id: ADMIN/DENTIST/RECEPTIONIST pueden filtrar por paciente
+    (ej. para mostrar turnos en la historia clínica del paciente).
+    """
     filters = [Appointment.clinic_id == clinic_id]
 
-    if "ADMIN" not in roles:
+    if patient_user_id and any(r in roles for r in ("ADMIN", "DENTIST", "RECEPTIONIST")):
+        # Contexto historia clínica: mostrar todos los turnos del paciente en la clínica
+        filters.append(Appointment.patient_user_id == patient_user_id)
+    elif "ADMIN" not in roles:
         if "DENTIST" in roles:
             filters.append(Appointment.dentist_user_id == user_id)
         else:
