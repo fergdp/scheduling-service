@@ -28,15 +28,18 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # 1. Reemplazar el índice no-único por UNIQUE constraint.
-    op.drop_index('ix_appointments_google_event_id', table_name='appointments')
+    # 1. Crear UNIQUE primero. MySQL no soporta DDL transaccional: si esto fallara
+    #    (duplicados existentes), no debe dejar la tabla sin el índice anterior.
     op.create_unique_constraint(
         'uq_appointments_google_event_id',
         'appointments',
         ['google_event_id']
     )
 
-    # 2. CHECK constraint: rango temporal coherente.
+    # 2. Recién ahora dropear el índice no-único viejo (redundante con el UNIQUE).
+    op.drop_index('ix_appointments_google_event_id', table_name='appointments')
+
+    # 3. CHECK constraint: rango temporal coherente.
     op.create_check_constraint(
         'chk_appointments_time_range',
         'appointments',
@@ -46,10 +49,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_constraint('chk_appointments_time_range', 'appointments', type_='check')
-    op.drop_constraint('uq_appointments_google_event_id', 'appointments', type_='unique')
     op.create_index(
         'ix_appointments_google_event_id',
         'appointments',
         ['google_event_id'],
         unique=False
     )
+    op.drop_constraint('uq_appointments_google_event_id', 'appointments', type_='unique')
