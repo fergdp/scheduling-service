@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Text, Boolean, func, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Enum, Text, Boolean, func, ForeignKey, CheckConstraint
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
 from datetime import datetime
@@ -57,7 +57,7 @@ class Appointment(Base):
     patient_timezone = Column(String(50), default="UTC")
 
     status = Column(Enum(AppointmentStatus), default=AppointmentStatus.SCHEDULED, nullable=False)
-    google_event_id = Column(String(255), nullable=True, index=True)
+    google_event_id = Column(String(255), nullable=True, unique=True)
     gcal_sync_status = Column(
         Enum(GcalSyncStatus),
         default=GcalSyncStatus.NOT_CONFIGURED,
@@ -69,6 +69,10 @@ class Appointment(Base):
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("start_time_utc < end_time_utc", name="chk_appointments_time_range"),
+    )
 
 class AppointmentAuditLog(Base):
     __tablename__ = "appointment_audit_logs"
