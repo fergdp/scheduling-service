@@ -7,10 +7,7 @@ from typing import Optional
 from jose import jwt, JWTError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
-from dotenv import load_dotenv
 from contextvars import ContextVar
-
-load_dotenv()
 
 # Logger configuration
 logger = logging.getLogger(__name__)

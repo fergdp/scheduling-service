@@ -1,11 +1,8 @@
 import os
 from cryptography.fernet import Fernet
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # La FERNET_KEY debe ser de 32 bytes y estar codificada en base64.
-# Se obtiene del archivo .env
+# Se obtiene del archivo .env (cargado por main.py al inicio).
 FERNET_KEY = os.getenv("FERNET_KEY")
 
 if not FERNET_KEY:

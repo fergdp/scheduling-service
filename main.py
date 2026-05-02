@@ -21,8 +21,6 @@ class CustomJsonFormatter(jsonlogger.JsonFormatter):
         log_record["level"] = record.levelname
         log_record["service"] = "scheduling-service"
         log_record["environment"] = os.getenv("APP_ENVIRONMENT", "prod")
-        log_record.setdefault("trace_id", "")
-        log_record.setdefault("span_id", "")
         log_record.setdefault("user_id", "")
         log_record.setdefault("operation", "")
         log_record.setdefault("duration_ms", "")
@@ -89,13 +87,9 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS Configuration
-origins = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://atuconsul.com",
-    "https://www.atuconsul.com"
-]
+# CORS Configuration — origins from env (CORS_ORIGINS, comma-separated)
+_cors_default = "http://localhost:3000,http://localhost:3001,https://atuconsul.com,https://www.atuconsul.com"
+origins = [o.strip() for o in os.getenv("CORS_ORIGINS", _cors_default).split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
