@@ -1,7 +1,25 @@
 import pytest
 from unittest.mock import MagicMock, patch
+import dependencies
 from dependencies import get_clinic_id, get_user_id, get_db
 from fastapi import HTTPException
+
+
+@pytest.fixture(autouse=True)
+def clear_clinic_cache():
+    dependencies._user_clinic_cache.clear()
+    yield
+    dependencies._user_clinic_cache.clear()
+
+
+def _patch_db_returning(clinic_id):
+    fake_session = MagicMock()
+    if clinic_id is None:
+        fake_session.execute.return_value.first.return_value = None
+    else:
+        fake_session.execute.return_value.first.return_value = (clinic_id,)
+    return patch.object(dependencies, "SessionLocal", return_value=fake_session)
+
 
 def test_get_clinic_id_unauthorized():
     """Verifica que get_clinic_id lance 401 si no hay payload."""
@@ -20,6 +38,44 @@ def test_get_clinic_id_missing_field():
     with pytest.raises(HTTPException) as exc:
         get_clinic_id({"user_id": 1})
     assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Defense-in-depth (#82 H1): cross-check JWT.clinic_id vs DB
+# ---------------------------------------------------------------------------
+
+def test_get_clinic_id_authorizes_when_jwt_matches_db():
+    with _patch_db_returning(1):
+        assert get_clinic_id({"user_id": 99, "clinic_id": 1}) == 1
+
+
+def test_get_clinic_id_fails_close_when_jwt_clinic_mismatches_db():
+    with _patch_db_returning(1):
+        with pytest.raises(HTTPException) as exc:
+            get_clinic_id({"user_id": 99, "clinic_id": 2})
+        assert exc.value.status_code == 401
+
+
+def test_get_clinic_id_fails_close_when_user_not_in_db():
+    with _patch_db_returning(None):
+        with pytest.raises(HTTPException) as exc:
+            get_clinic_id({"user_id": 999, "clinic_id": 1})
+        assert exc.value.status_code == 401
+
+
+def test_get_clinic_id_rejects_token_without_user_id():
+    with pytest.raises(HTTPException) as exc:
+        get_clinic_id({"clinic_id": 1})
+    assert exc.value.status_code == 401
+
+
+def test_db_lookup_is_cached_within_ttl():
+    fake_session = MagicMock()
+    fake_session.execute.return_value.first.return_value = (1,)
+    with patch.object(dependencies, "SessionLocal", return_value=fake_session):
+        get_clinic_id({"user_id": 99, "clinic_id": 1})
+        get_clinic_id({"user_id": 99, "clinic_id": 1})
+    assert fake_session.execute.call_count == 1
 
 def test_get_user_id_missing_field():
     """Verifica error si falta user_id en el payload."""

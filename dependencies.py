@@ -1,12 +1,14 @@
 import logging
 import base64
 import os
+import threading
 from fastapi import Header, HTTPException, Depends, Cookie
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from jose import jwt, JWTError
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
+from cachetools import TTLCache
 from contextvars import ContextVar
 
 # Logger configuration
@@ -70,13 +72,55 @@ def get_current_user(
     except JWTError:
         return None
 
+# Defense-in-depth (#82 H1): cache user_id -> clinic_id de DB con TTL 60s para
+# detectar JWT con clinic_id manipulado sin pegarle a DB en cada request.
+_MISSING = object()
+_user_clinic_cache: TTLCache = TTLCache(maxsize=10000, ttl=60)
+_user_clinic_cache_lock = threading.Lock()
+
+
+def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
+    with _user_clinic_cache_lock:
+        cached = _user_clinic_cache.get(user_id, _MISSING)
+    if cached is not _MISSING:
+        return cached
+
+    db = SessionLocal()
+    try:
+        row = db.execute(
+            text("SELECT clinic_id FROM users WHERE user_id = :uid"),
+            {"uid": user_id},
+        ).first()
+    finally:
+        db.close()
+
+    db_clinic_id = row[0] if row else None
+    with _user_clinic_cache_lock:
+        _user_clinic_cache[user_id] = db_clinic_id
+    return db_clinic_id
+
+
 def get_clinic_id(payload: dict = Depends(get_current_user)) -> int:
     if payload is None:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing token")
 
     clinic_id = payload.get("clinic_id")
+    user_id = payload.get("user_id")
     if not clinic_id:
         raise HTTPException(status_code=401, detail="Clinic ID not found in token")
+    if not user_id:
+        logger.error("Token sin user_id — fail-close")
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    db_clinic_id = _resolve_db_clinic_id(int(user_id))
+    if db_clinic_id is None:
+        logger.error(f"SECURITY: user_id={user_id} no existe en DB — fail-close")
+        raise HTTPException(status_code=401, detail="Invalid token")
+    if int(db_clinic_id) != int(clinic_id):
+        logger.error(
+            f"SECURITY: clinic_id mismatch para user_id={user_id} — JWT={clinic_id} DB={db_clinic_id} — fail-close"
+        )
+        raise HTTPException(status_code=401, detail="Invalid token")
 
     clinic_id_int = int(clinic_id)
     current_clinic_id.set(clinic_id_int) # Activar el SQL Guard para esta petición

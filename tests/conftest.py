@@ -3,7 +3,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, StaticPool
 from sqlalchemy.orm import sessionmaker
 from main import app
-from dependencies import get_db, get_current_user
+from dependencies import get_db, get_current_user, get_clinic_id
 from models import Base
 
 # Setup SQLite in-memory for testing
@@ -45,9 +45,17 @@ def _make_client(user_override):
     y las restaura al estado previo al salir — no llama a .clear() global
     para no interferir con otros fixtures activos en el mismo test.
     """
+    # Bypass del cross-check JWT.clinic_id vs DB (#82 H1) para tests de endpoints:
+    # devolvemos el clinic_id del JWT mock directamente, los tests del cross-check
+    # viven en test_dependencies.py.
+    def override_get_clinic_id():
+        payload = user_override()
+        return int(payload["clinic_id"])
+
     previous = app.dependency_overrides.copy()
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_current_user] = user_override
+    app.dependency_overrides[get_clinic_id] = override_get_clinic_id
     try:
         with TestClient(app) as c:
             yield c
