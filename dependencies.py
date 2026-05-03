@@ -41,10 +41,28 @@ if not CLINIC_DATABASE_URL:
 # SQL Guard Context
 current_clinic_id: ContextVar[Optional[int]] = ContextVar("current_clinic_id", default=None)
 
-engine = create_engine(DATABASE_URL, pool_recycle=3600)
+# Pool sizing — issue #33.
+# `engine` recibe todo el tráfico de appointments → pool grande.
+# `clinic_engine` solo hace el SELECT del cross-check #82 H1 (cacheado TTL 60s)
+# → pool default-ish alcanza, no necesita 20.
+def _make_engine(url: str, pool_size: int, max_overflow: int):
+    # SQLite usa SingletonThreadPool y no acepta pool_size/max_overflow/pool_timeout.
+    # En tests (sqlite://) caemos a defaults; en prod (mysql+pymysql) aplican los pool kwargs.
+    if url.startswith("sqlite"):
+        return create_engine(url, pool_recycle=3600)
+    return create_engine(
+        url,
+        pool_recycle=3600,
+        pool_size=pool_size,
+        max_overflow=max_overflow,
+        pool_timeout=30,
+    )
+
+
+engine = _make_engine(DATABASE_URL, pool_size=20, max_overflow=40)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-clinic_engine = create_engine(CLINIC_DATABASE_URL, pool_recycle=3600)
+clinic_engine = _make_engine(CLINIC_DATABASE_URL, pool_size=5, max_overflow=10)
 ClinicSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=clinic_engine)
 
 def get_db():

@@ -1,6 +1,7 @@
 import logging
 import os
 import base64
+from contextlib import asynccontextmanager
 from datetime import datetime
 from fastapi import FastAPI, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,6 +9,7 @@ from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy import text
 from jose import jwt, JWTError
 from dotenv import load_dotenv
 from pythonjsonlogger import jsonlogger
@@ -72,7 +74,28 @@ except Exception as e:
     raise ValueError("Invalid JWT_SECRET_KEY format for middleware.")
 
 from csrf_middleware import CSRFMiddleware
-from dependencies import get_clinic_id, get_user_id
+from dependencies import get_clinic_id, get_user_id, engine, clinic_engine
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: warmup de ambos pools — falla rápido si una DB es inalcanzable
+    # en lugar de hacer pagar el costo a la primera request del primer usuario.
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        with clinic_engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logging.info("DB pools warmup OK (scheduling + clinic)")
+    except Exception as e:
+        logging.error(f"DB pools warmup FAILED: {e}")
+        raise
+    yield
+    # Shutdown: dispose pools para cerrar conexiones MySQL limpiamente al SIGTERM.
+    engine.dispose()
+    clinic_engine.dispose()
+    logging.info("DB pools disposed")
+
 
 # Setup Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -82,7 +105,8 @@ app = FastAPI(
     version=os.getenv("APP_VERSION", "1.0.0"),
     docs_url="/docs",
     redoc_url="/redoc",
-    redirect_slashes=False
+    redirect_slashes=False,
+    lifespan=lifespan,
 )
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
