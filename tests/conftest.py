@@ -1,3 +1,15 @@
+# Varios módulos validan env vars al import (raise ValueError si faltan):
+# dependencies.py → JWT_SECRET_KEY, DATABASE_URL, CLINIC_DATABASE_URL
+# utils/crypto.py → FERNET_KEY
+# setdefault sólo aplica si no están seteadas — el CI / dev real las pisa con
+# las suyas. Esto hace que `pytest tests/` corra en cualquier entorno limpio
+# sin tener que exportar nada antes.
+import os
+os.environ.setdefault("JWT_SECRET_KEY", "dGVzdC1zZWNyZXQ=")  # base64 de "test-secret"
+os.environ.setdefault("DATABASE_URL", "sqlite://")
+os.environ.setdefault("CLINIC_DATABASE_URL", "sqlite://")
+os.environ.setdefault("FERNET_KEY", "mgp552Y1rs_rkZO4lFIZKyStcqVmND1nFWSMZX9dCys=")
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, StaticPool
