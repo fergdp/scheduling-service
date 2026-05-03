@@ -32,11 +32,20 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise ValueError("DATABASE_URL environment variable not set.")
 
+# DB principal (dental-clinic) — solo para resolver user_id → clinic_id en el
+# cross-check de #82 H1. La tabla `users` vive ahí, no en la DB de scheduling.
+CLINIC_DATABASE_URL = os.getenv("CLINIC_DATABASE_URL")
+if not CLINIC_DATABASE_URL:
+    raise ValueError("CLINIC_DATABASE_URL environment variable not set.")
+
 # SQL Guard Context
 current_clinic_id: ContextVar[Optional[int]] = ContextVar("current_clinic_id", default=None)
 
 engine = create_engine(DATABASE_URL, pool_recycle=3600)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+clinic_engine = create_engine(CLINIC_DATABASE_URL, pool_recycle=3600)
+ClinicSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=clinic_engine)
 
 def get_db():
     # Multi-tenancy: NO hay SQL Guard automático.
@@ -85,7 +94,8 @@ def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
     if cached is not _MISSING:
         return cached
 
-    db = SessionLocal()
+    # `users` vive en la DB de dental-clinic, no en la de scheduling.
+    db = ClinicSessionLocal()
     try:
         row = db.execute(
             text("SELECT clinic_id FROM users WHERE user_id = :uid"),

@@ -18,7 +18,7 @@ def _patch_db_returning(clinic_id):
         fake_session.execute.return_value.first.return_value = None
     else:
         fake_session.execute.return_value.first.return_value = (clinic_id,)
-    return patch.object(dependencies, "SessionLocal", return_value=fake_session)
+    return patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session)
 
 
 def test_get_clinic_id_unauthorized():
@@ -72,10 +72,28 @@ def test_get_clinic_id_rejects_token_without_user_id():
 def test_db_lookup_is_cached_within_ttl():
     fake_session = MagicMock()
     fake_session.execute.return_value.first.return_value = (1,)
-    with patch.object(dependencies, "SessionLocal", return_value=fake_session):
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
         get_clinic_id({"user_id": 99, "clinic_id": 1})
         get_clinic_id({"user_id": 99, "clinic_id": 1})
     assert fake_session.execute.call_count == 1
+
+
+def test_resolve_db_clinic_id_uses_clinic_db_not_scheduling_db():
+    """
+    Regresión: el cross-check #82 H1 debe hacer SELECT contra la DB de dental-clinic
+    (donde vive `users`), NO contra la DB de scheduling. Si alguien vuelve a usar
+    SessionLocal acá, scheduling tira 1146 "Table users doesn't exist" en prod.
+    """
+    fake_clinic_session = MagicMock()
+    fake_clinic_session.execute.return_value.first.return_value = (7,)
+    fake_scheduling_session = MagicMock()
+
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_clinic_session), \
+         patch.object(dependencies, "SessionLocal", return_value=fake_scheduling_session):
+        assert get_clinic_id({"user_id": 42, "clinic_id": 7}) == 7
+
+    fake_clinic_session.execute.assert_called_once()
+    fake_scheduling_session.execute.assert_not_called()
 
 def test_get_user_id_missing_field():
     """Verifica error si falta user_id en el payload."""
