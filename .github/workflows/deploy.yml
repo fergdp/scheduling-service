@@ -83,10 +83,10 @@ jobs:
               echo "unzip no encontrado, instalando..."
               apt-get update && apt-get install -y unzip
             fi
-            # Crear el directorio de la aplicación si no existe
-            mkdir -p ~/app/scheduling-service
+            # Crear el directorio de la aplicación si no existe (post #33: /opt + appuser)
+            mkdir -p /opt/scheduling-service
             # Descomprimir el artefacto
-            unzip -o ~/temp_deployment/scheduling-service.zip -d ~/app/scheduling-service
+            unzip -o ~/temp_deployment/scheduling-service.zip -d /opt/scheduling-service
             # Limpiar temporal
             rm ~/temp_deployment/scheduling-service.zip
             # Ejecutar el script de despliegue creado por Claude

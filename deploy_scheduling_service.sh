@@ -2,11 +2,13 @@
 set -x 
 
 # --- Configuración (Idéntica a tu salud pero con scheduling-service) ---
-APP_DIR="/root/app/scheduling-service"
+APP_DIR="/opt/scheduling-service"
+APP_USER="appuser"
 VENV_NAME="venv"
 APP_PORT=8002
 GUNICORN_PROCESS_NAME="scheduling-service-gunicorn"
-SUPERVISOR_CONF_FILE="/etc/supervisor/conf.d/scheduling-service.conf"
+# El supervisor real del VPS lee desde /root/supervisor_configs/, no /etc/supervisor/conf.d/.
+SUPERVISOR_CONF_FILE="/root/supervisor_configs/scheduling-service.conf"
 
 echo "Iniciando despliegue de scheduling-service..."
 
@@ -28,16 +30,22 @@ source "$VENV_NAME/bin/activate"
 # 2. Dependencias
 pip install -r requirements.txt
 
-# 3. TESTS Y COBERTURA — bloquea deploy si fallan o cobertura < 80%
-echo "Ejecutando tests con cobertura..."
-python -m pytest tests/ --cov=. --cov-config=.coveragerc -q || {
-    echo "Error: Tests fallidos o cobertura insuficiente. Deploy cancelado."
-    exit 1
-}
+# 3. Cargar .env para que alembic levante DATABASE_URL al correr migraciones.
+# El zip del workflow excluye .env (vive en VPS, no en repo); existe en $APP_DIR.
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
 
-# 5. MIGRACIONES AUTOMÁTICAS (La magia de Alembic)
+# 4. MIGRACIONES AUTOMÁTICAS (Alembic). Tests ya corrieron en CI antes del SCP
+# (step "Run tests" del workflow); no se re-corren acá porque el zip excluye tests/.
 echo "Aplicando migraciones automáticas a la base de datos..."
 alembic upgrade head || { echo "Error: Fallaron las migraciones."; exit 1; }
+
+# 5. Ownership: el unzip + pip install + alembic crean archivos como root.
+# Restaurar ownership a appuser para que gunicorn pueda leerlos al arrancar.
+sudo chown -R "$APP_USER:$APP_USER" "$APP_DIR"
 
 # 6. Detener servicio
 sudo supervisorctl stop scheduling-service || true
