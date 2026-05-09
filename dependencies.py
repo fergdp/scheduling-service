@@ -128,20 +128,54 @@ def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
     return db_clinic_id
 
 
+def _is_admin(payload: dict) -> bool:
+    """ROLE_ADMIN check con tolerancia al prefijo Spring (`ROLE_`)."""
+    roles = payload.get("roles") or []
+    return any(r.upper().removeprefix("ROLE_") == "ADMIN" for r in roles)
+
+
 def get_clinic_id(payload: dict = Depends(get_current_user)) -> int:
+    """
+    Devuelve el clinic_id del JWT tras cross-check contra DB (issue #82 H1).
+
+    Distincion 401 vs 403 — importante para el frontend:
+      - 401: token invalido / ausente / mismatch malicioso → apiFactory redirige
+        a /login con sessionExpired=true (sesion realmente termino).
+      - 403: el user esta autenticado pero NO tiene contexto de clinica (admin
+        global sin clinica). El recurso requiere clinic context y no aplica para
+        este user; el frontend NO debe interpretar como sesion expirada — debe
+        mostrar UI alternativa o esconder el feature. Ver DashboardPage que oculta
+        DailyAgenda para admin sin clinica.
+    """
     if payload is None:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing token")
 
-    clinic_id = payload.get("clinic_id")
     user_id = payload.get("user_id")
-    if not clinic_id:
-        raise HTTPException(status_code=401, detail="Clinic ID not found in token")
     if not user_id:
         logger.error("Token sin user_id — fail-close")
         raise HTTPException(status_code=401, detail="Invalid token")
 
+    clinic_id = payload.get("clinic_id")
+    is_admin = _is_admin(payload)
+
+    # Admin global sin clinica en JWT: 403 explicito (no 401) — el resource necesita
+    # clinic context que admin no tiene, pero el token es valido.
+    if not clinic_id:
+        if is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Admin sin clinica seleccionada. Este recurso requiere contexto de clinica."
+            )
+        raise HTTPException(status_code=401, detail="Clinic ID not found in token")
+
     db_clinic_id = _resolve_db_clinic_id(int(user_id))
     if db_clinic_id is None:
+        # Admin con clinic_id en JWT pero NULL en DB → mismo razonamiento: 403.
+        if is_admin:
+            raise HTTPException(
+                status_code=403,
+                detail="Admin global sin clinica asignada en DB. Este recurso requiere contexto de clinica."
+            )
         logger.error(f"SECURITY: user_id={user_id} no existe en DB — fail-close")
         raise HTTPException(status_code=401, detail="Invalid token")
     if int(db_clinic_id) != int(clinic_id):

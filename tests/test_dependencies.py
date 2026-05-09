@@ -34,10 +34,57 @@ def test_get_user_id_unauthorized():
     assert exc.value.status_code == 401
 
 def test_get_clinic_id_missing_field():
-    """Verifica error si falta clinic_id en el payload."""
+    """Non-admin sin clinic_id en payload → 401 (token roto / sospechoso)."""
     with pytest.raises(HTTPException) as exc:
         get_clinic_id({"user_id": 1})
     assert exc.value.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Admin sin clinica: 403, NO 401 — preserva la sesion en el frontend
+# (apiFactory.js solo redirige al login con sessionExpired=true cuando es 401)
+# ---------------------------------------------------------------------------
+
+def test_get_clinic_id_admin_without_clinic_in_jwt_returns_403():
+    """Admin con clinic_id=0 (ROLE_ADMIN cross-clinic) → 403, no 401."""
+    payload = {"user_id": 1, "clinic_id": 0, "roles": ["ROLE_ADMIN"]}
+    with pytest.raises(HTTPException) as exc:
+        get_clinic_id(payload)
+    assert exc.value.status_code == 403
+    assert "clinica" in exc.value.detail.lower()
+
+
+def test_get_clinic_id_admin_without_clinic_no_role_prefix_returns_403():
+    """Same como el anterior pero con role sin prefijo ROLE_ (defensa por si Spring cambia)."""
+    payload = {"user_id": 1, "clinic_id": 0, "roles": ["ADMIN"]}
+    with pytest.raises(HTTPException) as exc:
+        get_clinic_id(payload)
+    assert exc.value.status_code == 403
+
+
+def test_get_clinic_id_admin_with_clinic_in_jwt_but_null_in_db_returns_403():
+    """Admin con clinic_id en JWT pero NULL en DB (cross-clinic real) → 403."""
+    payload = {"user_id": 1, "clinic_id": 99, "roles": ["ROLE_ADMIN"]}
+    with _patch_db_returning(None):
+        with pytest.raises(HTTPException) as exc:
+            get_clinic_id(payload)
+        assert exc.value.status_code == 403
+
+
+def test_get_clinic_id_admin_with_valid_clinic_passes():
+    """Admin que SI tiene clinic asignada pasa el cross-check normalmente."""
+    payload = {"user_id": 1, "clinic_id": 1, "roles": ["ROLE_ADMIN"]}
+    with _patch_db_returning(1):
+        assert get_clinic_id(payload) == 1
+
+
+def test_get_clinic_id_non_admin_user_not_in_db_still_401():
+    """Regresion: non-admin sin row en DB sigue siendo 401 fail-close (no 403)."""
+    payload = {"user_id": 999, "clinic_id": 1, "roles": ["ROLE_DENTIST"]}
+    with _patch_db_returning(None):
+        with pytest.raises(HTTPException) as exc:
+            get_clinic_id(payload)
+        assert exc.value.status_code == 401
 
 
 # ---------------------------------------------------------------------------
