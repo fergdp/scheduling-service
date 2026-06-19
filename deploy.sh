@@ -32,16 +32,21 @@ fi
 
 cd "$APP_DIR" || exit 1
 
-# 1. Entorno Virtual
-if [ ! -d "$VENV_NAME" ]; then
-    python3 -m venv "$VENV_NAME"
+# 1. Entorno Virtual — usar el pip/alembic del venv por PATH ABSOLUTO, NO 'source activate'.
+# CAUSA RAÍZ del incidente #75: el venv de /opt fue COPIADO desde /root/app en la migración
+# del #33 (cp -a, May 4). Sus shebangs bin/* se corrigieron a /opt, pero el script
+# 'activate' quedó con VIRTUAL_ENV=/root/app -> 'source venv/bin/activate' + pip instalaba
+# las deps en /root/app/.../venv, mientras gunicorn (supervisor) corre /opt/.../venv (stale).
+# Dos venvs divergentes: las deps iban a uno y el runtime usaba el otro -> ModuleNotFoundError.
+# El pip ABSOLUTO de /opt instala en /opt (sys.prefix sale del pyvenv.cfg de /opt). Sin activate.
+VENV_BIN="$APP_DIR/venv/bin"
+if [ ! -x "$VENV_BIN/python" ]; then
+    python3 -m venv "$APP_DIR/venv"
 fi
-source "$VENV_NAME/bin/activate"
 
-# 2. Dependencias — DEBE abortar si falla. Esto corre ANTES de parar el servicio,
-# así que si el pip install falla, el servicio EN EJECUCIÓN queda intacto y el CI
-# se pone en rojo (antes seguía y reiniciaba con el venv stale -> crash-loop).
-pip install -r requirements.txt || {
+# 2. Dependencias — con el pip ABSOLUTO de /opt (el venv que usa gunicorn). DEBE abortar si
+# falla: corre ANTES de parar el servicio, así un fallo deja el servicio viejo en pie + CI rojo.
+"$VENV_BIN/pip" install -r requirements.txt || {
     echo "ERROR: 'pip install -r requirements.txt' falló. Abortando deploy; el servicio en ejecución NO se toca." >&2
     exit 1
 }
@@ -54,9 +59,10 @@ if [ -f .env ]; then
     set +a
 fi
 
-# 4. MIGRACIONES AUTOMÁTICAS (Alembic). Tests ya corrieron en CI antes del SCP.
+# 4. MIGRACIONES AUTOMÁTICAS (alembic del venv de /opt, path absoluto). Tests ya
+# corrieron en CI antes del SCP. Las vars del .env (DATABASE_URL) se exportaron arriba.
 echo "Aplicando migraciones automáticas a la base de datos..."
-alembic upgrade head || { echo "Error: Fallaron las migraciones."; exit 1; }
+"$VENV_BIN/alembic" upgrade head || { echo "Error: Fallaron las migraciones."; exit 1; }
 
 # 5. Ownership: el unzip + pip install + alembic crean archivos como root.
 sudo chown -R "$APP_USER:$APP_USER" "$APP_DIR"
@@ -104,5 +110,4 @@ if [ "$HEALTHY" != "1" ]; then
     exit 1
 fi
 
-deactivate
 echo "Despliegue de scheduling-service completado con éxito."
