@@ -12,6 +12,7 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from jose import jwt, JWTError
 from dotenv import load_dotenv
+from prometheus_fastapi_instrumentator import Instrumentator
 from pythonjsonlogger import jsonlogger
 
 load_dotenv()
@@ -135,7 +136,7 @@ app.add_middleware(CSRFMiddleware)
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     # Skip verbose logging for health probes to avoid log noise
-    if request.url.path.startswith("/health"):
+    if request.url.path.startswith(("/health", "/metrics")):
         return await call_next(request)
 
     user_id = "anonymous"
@@ -215,6 +216,14 @@ from routers import oauth, appointments, health as health_router
 app.include_router(health_router.router)
 app.include_router(oauth.router, prefix="/clinic-scheduling-api/v1/oauth", tags=["OAuth"])
 app.include_router(appointments.router, prefix="/clinic-scheduling-api/v1/appointments", tags=["Appointments"])
+
+# Observabilidad (issue #75): métricas RED en /metrics para Prometheus.
+# En prod, PROMETHEUS_MULTIPROC_DIR (del supervisor) activa el modo multiproceso
+# que agrega los workers de gunicorn (ver gunicorn_conf.py); en local/test cae a
+# single-process. excluded_handlers evita contar scrapes y /health.
+Instrumentator(excluded_handlers=["/metrics", "/health"]).instrument(app).expose(
+    app, endpoint="/metrics", include_in_schema=False
+)
 
 if __name__ == "__main__":
     import uvicorn
