@@ -89,5 +89,8 @@ jobs:
             unzip -o ~/temp_deployment/scheduling-service.zip -d /opt/scheduling-service
             # Limpiar temporal
             rm ~/temp_deployment/scheduling-service.zip
-            # Ejecutar el script de despliegue creado por Claude
-            APP_VERSION=${{ env.APP_VERSION }} ~/deploy_scheduling.sh
+            # Ejecutar el script de despliegue VERSIONADO EN EL REPO (lo trae el unzip a
+            # /opt/scheduling-service/). Reemplaza al ~/deploy_scheduling.sh suelto del VPS,
+            # que no abortaba si fallaba el pip install ni verificaba que el servicio levantara
+            # (causa raíz del crash-loop con CI verde del 2026-06-19).
+            APP_VERSION=${{ env.APP_VERSION }} bash /opt/scheduling-service/deploy.sh
