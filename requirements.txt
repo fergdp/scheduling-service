@@ -1,4 +1,12 @@
-fastapi==0.115.0
+# FastAPI se pinea a 0.136.0 (NO 0.137.x) a proposito: FastAPI 0.137.0 refactorizo
+# include_router() para guardar objetos _IncludedRouter (sin .path) en app.routes
+# (fastapi/fastapi#15745), lo que rompe prometheus-fastapi-instrumentator
+# (issue trallnag#370, abierto, sin fix). 0.136.0 es la ultima previa al refactor y
+# ya soporta starlette 1.x. starlette 1.3.1 arregla los CVE de starlette
+# (CVE-2026-48817/48818/54282/54283 y los previos). Revisitar 0.137 cuando el
+# instrumentator publique el fix.
+fastapi==0.136.0
+starlette==1.3.1
 uvicorn==0.30.6
 gunicorn==23.0.0
 sqlalchemy==2.0.35
@@ -13,7 +21,7 @@ google-auth-oauthlib==1.2.1
 google-auth-httplib2==0.2.0
 slowapi==0.1.9
 alembic==1.13.3
-python-multipart==0.0.12
+python-multipart==0.0.31
 python-json-logger==2.0.7
 python-logging-loki==0.3.1
 cachetools==5.5.0
