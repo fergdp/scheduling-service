@@ -11,6 +11,26 @@ def _get_valid_state(client) -> tuple[str, str]:
     return state, cookie
 
 
+def _fijar_cookie_state(client, valor: str) -> None:
+    """
+    Deja EXACTAMENTE una cookie `oauth_state` en el cliente.
+
+    No se usa el `cookies=` per-request de httpx —el que la propia librería deprecó por
+    "the expected behaviour on cookie persistence is ambiguous"— porque **no pisa** la
+    cookie que ya dejó la respuesta de /url: quedan las dos en el jar, con distinto
+    domain, y el header sale `oauth_state=A; oauth_state=B`. Cuál gana depende del orden
+    del jar, que cambia al agregar cualquier otra cookie.
+
+    Medido al sembrar la cookie de CSRF del #262: con el jar vacío el header salía
+    `BUENA; ADULTERADA` y ganaba la adulterada, así que el test de state adulterado
+    pasaba; con una cookie más en el jar el orden se dio vuelta a
+    `ADULTERADA; BUENA` y el mismo test empezó a dar 200. O sea que estaba pasando
+    por el orden accidental del jar, no porque el servidor rechazara nada.
+    """
+    client.cookies.delete("oauth_state")
+    client.cookies.set("oauth_state", valor)
+
+
 def test_get_oauth_url(client):
     """Verifica que se genere una URL de Google válida y se setee la cookie de state."""
     response = client.get("/clinic-scheduling-api/v1/oauth/url")
@@ -33,9 +53,9 @@ def test_oauth_callback_success(mock_email, mock_exchange, client):
 
     state, cookie = _get_valid_state(client)
 
+    _fijar_cookie_state(client, cookie)
     response = client.get(
-        f"/clinic-scheduling-api/v1/oauth/callback?code=fake_code_123&state={state}",
-        cookies={"oauth_state": cookie}
+        f"/clinic-scheduling-api/v1/oauth/callback?code=fake_code_123&state={state}"
     )
 
     assert response.status_code == 200
@@ -52,6 +72,10 @@ def test_oauth_callback_without_state_cookie(mock_email, mock_exchange, client):
     mock_email.return_value = "x@gmail.com"
 
     state, _ = _get_valid_state(client)
+    # Sin este delete el test no prueba lo que dice: /url ya dejó la cookie BUENA en el
+    # jar y el cliente la manda igual, así que se estaba ejercitando el camino "cookie
+    # que coincide", no el de "sin cookie".
+    client.cookies.delete("oauth_state")
 
     response = client.get(
         f"/clinic-scheduling-api/v1/oauth/callback?code=fake_code&state={state}"
@@ -70,9 +94,9 @@ def test_oauth_callback_wrong_state_cookie(mock_email, mock_exchange, client):
     state, _ = _get_valid_state(client)
     tampered_cookie = state[:-4] + "xxxx"  # cookie alterada
 
+    _fijar_cookie_state(client, tampered_cookie)
     response = client.get(
-        f"/clinic-scheduling-api/v1/oauth/callback?code=fake_code&state={state}",
-        cookies={"oauth_state": tampered_cookie}
+        f"/clinic-scheduling-api/v1/oauth/callback?code=fake_code&state={state}"
     )
     assert response.status_code == 400
     assert "CSRF" in response.json()["detail"] or "state" in response.json()["detail"].lower()
@@ -80,8 +104,8 @@ def test_oauth_callback_wrong_state_cookie(mock_email, mock_exchange, client):
 
 def test_oauth_callback_invalid_state_jwt(client):
     """State que no es un JWT válido debe devolver 400."""
+    _fijar_cookie_state(client, "not_a_jwt_at_all")
     response = client.get(
-        "/clinic-scheduling-api/v1/oauth/callback?code=fake_code&state=not_a_jwt_at_all",
-        cookies={"oauth_state": "not_a_jwt_at_all"}
+        "/clinic-scheduling-api/v1/oauth/callback?code=fake_code&state=not_a_jwt_at_all"
     )
     assert response.status_code == 400
