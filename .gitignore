@@ -31,3 +31,12 @@ coverage.xml
 htmlcov/
 *.zip
 alembic_backup/
+
+# Herramientas de Claude Code. Incluye .claude/worktrees/, donde viven las copias
+# de trabajo aisladas: versionarlas duplicaria el repo adentro de si mismo.
+# Ojo que estar ignorado NO alcanza para que uvicorn --reload las deje en paz;
+# el watcher mira el filesystem, no git (issue #270).
+.claude/
+
+# Basura que deja Git Bash al crashear
+*.stackdump
