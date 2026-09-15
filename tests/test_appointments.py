@@ -375,8 +375,11 @@ def test_other_dentist_cannot_complete_appointment(other_dentist_client):
     assert res.status_code == 403
 
 
-def test_cannot_change_status_of_cancelled_appointment(client):
-    """No se puede cambiar el estado de un turno ya CANCELLED."""
+def test_staff_can_change_status_of_cancelled_appointment(client):
+    """
+    Un turno CANCELLED ya no es terminal (agenda de recepción, #285): el staff lo puede
+    marcar como atendido. Antes este test afirmaba el 422.
+    """
     apt_id = create_appointment(client, dentist_user_id=1, days_ahead=27)
     client.patch(f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
                  json={"status": "CANCELLED"})
@@ -384,11 +387,15 @@ def test_cannot_change_status_of_cancelled_appointment(client):
         f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
         json={"status": "COMPLETED"}
     )
-    assert res.status_code == 422
+    assert res.status_code == 200
+    assert res.json()["status"] == "COMPLETED"
 
 
-def test_cannot_change_status_of_completed_appointment(client):
-    """No se puede cambiar el estado de un turno ya COMPLETED."""
+def test_staff_can_change_status_of_completed_appointment(client):
+    """
+    Un turno COMPLETED tampoco es terminal (#285): marcado por error, se puede cancelar
+    o volver a programar. Antes este test afirmaba el 422.
+    """
     apt_id = create_appointment(client, dentist_user_id=1, days_ahead=28)
     client.patch(f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
                  json={"status": "COMPLETED"})
@@ -396,7 +403,8 @@ def test_cannot_change_status_of_completed_appointment(client):
         f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
         json={"status": "CANCELLED"}
     )
-    assert res.status_code == 422
+    assert res.status_code == 200
+    assert res.json()["status"] == "CANCELLED"
 
 
 # ---------------------------------------------------------------------------

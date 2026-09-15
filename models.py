@@ -7,9 +7,23 @@ class Base(DeclarativeBase):
     pass
 
 class AppointmentStatus(enum.Enum):
-    SCHEDULED  = "SCHEDULED"
-    COMPLETED  = "COMPLETED"
-    CANCELLED  = "CANCELLED"
+    # Los tres "activos" ocupan el hueco del odontólogo; los otros tres lo liberan.
+    SCHEDULED  = "SCHEDULED"   # Programado: se dio el turno
+    CONFIRMED  = "CONFIRMED"   # Confirmado: el paciente confirmó por teléfono/WhatsApp
+    ARRIVED    = "ARRIVED"     # En espera: el paciente llegó y está en la sala
+    COMPLETED  = "COMPLETED"   # Atendido
+    CANCELLED  = "CANCELLED"   # Cancelado: avisó que no viene
+    NO_SHOW    = "NO_SHOW"     # Ausente: no vino y no avisó
+
+
+# Estados que reservan el hueco: cuentan para el solapamiento, la disponibilidad y el
+# widget de próximos turnos. Entrar a uno de estos desde uno inactivo vuelve a chequear
+# solapamiento, porque el hueco pudo ocuparse mientras el turno estaba cancelado.
+ACTIVE_STATUSES = frozenset({
+    AppointmentStatus.SCHEDULED,
+    AppointmentStatus.CONFIRMED,
+    AppointmentStatus.ARRIVED,
+})
 
 class GcalSyncStatus(enum.Enum):
     NOT_CONFIGURED = "NOT_CONFIGURED"  # dentista sin Google Calendar conectado
@@ -66,6 +80,12 @@ class Appointment(Base):
 
     reason = Column(Text, nullable=True)
     observations = Column(Text, nullable=True)
+
+    # Borrado lógico: "lo cargué mal", distinto de CANCELLED ("el paciente avisó que no viene",
+    # que queda en el historial). Un turno con deleted_at no se lee desde ningún endpoint;
+    # la fila se conserva porque appointment_audit_logs tiene FK a este id.
+    deleted_at = Column(DateTime, nullable=True)
+    deleted_by_user_id = Column(Integer, nullable=True)
 
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())

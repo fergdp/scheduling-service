@@ -51,6 +51,18 @@ def setup_database():
     yield
     Base.metadata.drop_all(bind=engine)
 
+
+@pytest.fixture(autouse=True)
+def dentistas_de_la_clinica_1(monkeypatch):
+    """
+    Los endpoints validan que el odontólogo del turno sea de la clínica (#286) con un SELECT
+    a `users` de dental-clinic, tabla que la base de tests no tiene. Por defecto todo
+    odontólogo es de la clínica 1 (la de las fixtures); el test que prueba la validación
+    reemplaza esto con un mapa explícito.
+    """
+    import routers.appointments as ra
+    monkeypatch.setattr(ra, "_clinic_of_user", lambda user_id: 1)
+
 def _sembrar_csrf(c):
     """
     Deja al cliente con la cookie XSRF-TOKEN y el header X-XSRF-TOKEN puestos, que es
@@ -146,3 +158,19 @@ def other_dentist_client():
     def _dentist():
         return {"user_id": 99, "clinic_id": 1, "roles": ["DENTIST"]}
     yield from _make_client(_dentist)
+
+
+@pytest.fixture
+def receptionist_client():
+    """Recepcionista de la clínica 1 (user_id=50), sin ningún otro rol."""
+    def _receptionist():
+        return {"user_id": 50, "clinic_id": 1, "roles": ["RECEPTIONIST"]}
+    yield from _make_client(_receptionist)
+
+
+@pytest.fixture
+def other_clinic_client():
+    """Recepcionista de OTRA clínica (clinic_id=2, user_id=60): para el aislamiento multi-tenant."""
+    def _receptionist():
+        return {"user_id": 60, "clinic_id": 2, "roles": ["RECEPTIONIST"]}
+    yield from _make_client(_receptionist)

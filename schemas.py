@@ -40,8 +40,8 @@ class AppointmentBase(BaseModel):
 
 
 class AppointmentCreate(BaseModel):
-    dentist_user_id: int
-    patient_user_id: int
+    dentist_user_id: int = Field(gt=0)
+    patient_user_id: int = Field(gt=0)
     patient_name: Optional[str] = None
     patient_email: Optional[str] = None
     patient_phone: Optional[str] = None
@@ -77,10 +77,15 @@ class AppointmentCreate(BaseModel):
 
 
 class AppointmentUpdate(BaseModel):
-    """Editar fecha/hora y/o motivo de un turno existente."""
+    """
+    Editar fecha/hora, motivo y/o odontólogo de un turno activo.
+    dentist_user_id: cambiar de profesional (sólo staff). El turno se saca del Google
+    Calendar del odontólogo anterior y se crea en el del nuevo, si lo tiene conectado.
+    """
     start_time_utc: Optional[datetime] = None
     end_time_utc: Optional[datetime] = None
     reason: Optional[str] = None
+    dentist_user_id: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("start_time_utc")
     @classmethod
@@ -107,6 +112,8 @@ class AppointmentResponse(BaseModel):
     dentist_user_id: int
     patient_user_id: int
     patient_name: Optional[str] = None
+    # Teléfono para que recepción pueda llamar desde la ficha del turno.
+    patient_phone: Optional[str] = None
     start_time_utc: datetime
     end_time_utc: datetime
     patient_timezone: str
@@ -121,7 +128,11 @@ class AppointmentResponse(BaseModel):
 
 
 class AppointmentStatusUpdate(BaseModel):
-    """Solo se permiten transiciones SCHEDULED→COMPLETED y SCHEDULED→CANCELLED."""
+    """
+    Cambio de estado. El staff (ADMIN, RECEPTIONIST, odontólogo asignado) puede pasar a
+    cualquier estado distinto del actual; el paciente sólo puede cancelar un turno
+    programado o confirmado. Las reglas viven en el endpoint.
+    """
     status: AppointmentStatus
     change_reason: Optional[str] = None
 

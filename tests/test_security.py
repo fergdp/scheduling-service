@@ -32,6 +32,7 @@ RUTAS_MUTANTES = [
     ("POST", f"{BASE}/appointments/", {}, 422),                     # falta el body
     ("PUT", f"{BASE}/appointments/999999", {}, 404),                # no existe
     ("PATCH", f"{BASE}/appointments/999999/status", {}, 422),       # falta el body
+    ("DELETE", f"{BASE}/appointments/999999", None, 404),           # no existe (#287)
     ("DELETE", f"{BASE}/oauth/disconnect", None, 200),              # no-op, borra nada
 ]
 
