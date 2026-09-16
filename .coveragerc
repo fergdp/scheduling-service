@@ -1,12 +1,19 @@
 [run]
+# Sin `branch`, el gate mide sólo sentencias: `schemas.py` llegó a 58% de ramas con
+# 95% de sentencias y nadie se enteró. Las ramas son las que detectan el `else` que
+# nadie probó, que es donde viven los bugs de permisos.
+branch = True
 source = .
 omit =
     venv/*
     alembic/*
     tests/*
     main.py
+    gunicorn_conf.py
     deploy_scheduling_service.sh
 
 [report]
 show_missing = True
-fail_under = 80
+# Sube de 80 a 90 con la tanda del epic #294: lo medido es 95,3%, y un gate quince puntos
+# por debajo de lo real no detecta regresiones, sólo catastrofes.
+fail_under = 90

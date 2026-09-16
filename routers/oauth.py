@@ -1,3 +1,5 @@
+import html
+import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
@@ -28,6 +30,16 @@ try:
     _SECRET_BYTES = base64.b64decode(SECRET_KEY_RAW)
 except Exception:
     _SECRET_BYTES = SECRET_KEY_RAW.encode()
+
+
+def _origen_del_front() -> str:
+    """
+    A qué ventana se le puede contar que Google quedó vinculado. Sale del primer origen de
+    `CORS_ORIGINS`, que es el del front que abrió el popup.
+    """
+    origenes = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+    return origenes[0] if origenes else "https://atuconsul.com"
+
 
 router = APIRouter()
 
@@ -187,6 +199,14 @@ async def oauth_callback(
 
         logger.info(f"Successfully linked Google account {google_email} for dentist {user_id} in clinic {clinic_id}")
 
+        # El mail lo devuelve Google, no el usuario, pero igual entra a un HTML y a un string
+        # de JavaScript: escapado en los dos formatos, cada uno con su escape.
+        email_html = html.escape(google_email or "")
+        email_js = json.dumps(google_email or "")
+        # Y el mensaje va SÓLO a la ventana que abrió el popup. Con '*' lo recibía cualquier
+        # página que lo hubiera abierto.
+        origen_js = json.dumps(_origen_del_front())
+
         return HTMLResponse(content=f"""<!DOCTYPE html>
 <html lang="es">
 <head><meta charset="UTF-8"><title>Google Calendar Vinculado</title>
@@ -196,11 +216,11 @@ h2{{color:#1976d2;margin-bottom:.5rem}}p{{color:#555;margin-bottom:1.5rem}}
 .email{{font-weight:bold;color:#333}}</style></head>
 <body><div class="box">
 <h2>✓ Google Calendar Vinculado</h2>
-<p>Tu cuenta <span class="email">{google_email}</span><br>fue conectada con éxito.</p>
+<p>Tu cuenta <span class="email">{email_html}</span><br>fue conectada con éxito.</p>
 <p>Podés cerrar esta ventana.</p>
 </div>
 <script>
-  if(window.opener){{window.opener.postMessage({{type:'gcal_connected',email:'{google_email}'}},'*');}}
+  if(window.opener){{window.opener.postMessage({{type:'gcal_connected',email:{email_js}}},{origen_js});}}
   setTimeout(function(){{window.close();}},2000);
 </script></body></html>""")
     except Exception as e:

@@ -113,7 +113,18 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # CORS Configuration — origins from env (CORS_ORIGINS, comma-separated)
-_cors_default = "http://localhost:3000,http://localhost:3001,https://atuconsul.com,https://www.atuconsul.com"
+#
+# ⚠️ El default NO puede incluir localhost en producción. Con `allow_credentials=True`, una
+# página servida desde `http://localhost:3000` puede pedirle datos a la API de producción con
+# la cookie del visitante y LEER la respuesta: la agenda de su clínica, con nombres y
+# teléfonos. El CSRF no lo tapa, porque sólo cubre las mutaciones.
+#
+# Los orígenes de desarrollo se suman sólo fuera de producción; en prod, o está `CORS_ORIGINS`
+# en el `.env` del servidor, o quedan únicamente los dominios propios.
+_CORS_PROD = "https://atuconsul.com,https://www.atuconsul.com"
+_CORS_DEV = "http://localhost:3000,http://localhost:3001"
+_es_produccion = os.getenv("APP_ENVIRONMENT", "prod").lower() in ("prod", "production")
+_cors_default = _CORS_PROD if _es_produccion else f"{_CORS_DEV},{_CORS_PROD}"
 origins = [o.strip() for o in os.getenv("CORS_ORIGINS", _cors_default).split(",") if o.strip()]
 
 app.add_middleware(

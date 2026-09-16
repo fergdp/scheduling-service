@@ -1,7 +1,25 @@
+import re
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from datetime import datetime, timezone
 from typing import Optional
 from models import AppointmentStatus, GcalSyncStatus
+
+# Forma mínima de un mail: algo, arroba, dominio con punto. No valida que exista.
+_FORMA_DE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _a_utc(v: datetime) -> datetime:
+    """
+    Lleva la fecha a UTC. Sin huso se asume que ya viene en UTC (los campos se llaman
+    `*_time_utc`); con huso se CONVIERTE.
+
+    ⚠️ Antes se le pegaba el huso UTC sin convertir, así que el instante que validaba el
+    "tiene que ser futuro" no era el instante que después se guardaba. Con eso, un
+    `2026-09-15T14:43-14:00` pasaba el validador (su instante real es futuro) y terminaba
+    guardado diez horas en el pasado. Lo fija `tests/test_integridad_turnos.py`.
+    """
+    return v.astimezone(timezone.utc) if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
 
 
 class OAuthUrlResponse(BaseModel):
@@ -55,11 +73,9 @@ class AppointmentCreate(BaseModel):
     @field_validator("start_time_utc")
     @classmethod
     def start_must_be_future(cls, v: datetime) -> datetime:
-        now = datetime.now(timezone.utc)
-        v_aware = v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
-        if v_aware <= now:
+        if _a_utc(v) <= datetime.now(timezone.utc):
             raise ValueError("start_time_utc must be in the future")
-        return v_aware
+        return _a_utc(v)
 
     @field_validator("reason")
     @classmethod
@@ -68,12 +84,27 @@ class AppointmentCreate(BaseModel):
             raise ValueError("reason must be 500 characters or fewer")
         return v
 
+    @field_validator("patient_email")
+    @classmethod
+    def email_con_forma_de_email(cls, v: Optional[str]) -> Optional[str]:
+        """
+        El mail viaja como invitado a Google Calendar. Uno mal tipeado hace fallar el alta del
+        evento ENTERO: el turno queda guardado pero sin evento en la agenda del odontólogo, y
+        el único aviso es un badge de sincronización fallida. Mejor rechazarlo acá.
+
+        Es una comprobación de forma, no de existencia: el validador estricto pediría la
+        dependencia `email-validator`, que este servicio no tiene instalada.
+        """
+        if v is None or v == "":
+            return None
+        if not _FORMA_DE_EMAIL.match(v):
+            raise ValueError("patient_email is not a valid email address")
+        return v
+
     @field_validator("end_time_utc")
     @classmethod
     def normalize_end_time(cls, v: Optional[datetime]) -> Optional[datetime]:
-        if v is None:
-            return None
-        return v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+        return _a_utc(v) if v is not None else None
 
 
 class AppointmentUpdate(BaseModel):
@@ -92,11 +123,15 @@ class AppointmentUpdate(BaseModel):
     def start_must_be_future(cls, v: Optional[datetime]) -> Optional[datetime]:
         if v is None:
             return None
-        now = datetime.now(timezone.utc)
-        v_aware = v if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
-        if v_aware <= now:
+        if _a_utc(v) <= datetime.now(timezone.utc):
             raise ValueError("start_time_utc must be in the future")
-        return v_aware
+        return _a_utc(v)
+
+    @field_validator("end_time_utc")
+    @classmethod
+    def normalize_end_time(cls, v: Optional[datetime]) -> Optional[datetime]:
+        """El fin no tenia validador: un `+05:00` entraba crudo y corria el turno cinco horas."""
+        return _a_utc(v) if v is not None else None
 
     @field_validator("reason")
     @classmethod

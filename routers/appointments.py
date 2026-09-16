@@ -66,9 +66,16 @@ def _resolve_end_time(start: datetime, end: datetime | None, config) -> datetime
 
 
 def _naive(dt: datetime) -> datetime:
-    # SQLAlchemy DateTime sin timezone=True almacena UTC naive; strip tzinfo para
-    # evitar TypeError al comparar con datetimes aware que vienen del exterior.
-    return dt.replace(tzinfo=None) if dt.tzinfo else dt
+    """
+    Pasa un datetime a UTC naive, que es como lo guarda la columna (DateTime sin timezone).
+
+    ⚠️ **CONVIERTE, no recorta.** Hacer `replace(tzinfo=None)` guarda el reloj de pared: las
+    10:00 de Buenos Aires quedaban almacenadas como las 10:00 UTC, o sea tres horas corridas.
+    Eso corría el turno en la agenda de todos Y abría un agujero en el chequeo de solapamiento,
+    porque el mismo instante escrito con dos husos distintos daba dos horas distintas y los dos
+    turnos entraban. Lo fija `tests/test_integridad_turnos.py`.
+    """
+    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def _utcnow_naive() -> datetime:
@@ -114,6 +121,18 @@ def _require_dentist_of_clinic(dentist_user_id: int, clinic_id: int) -> None:
         raise HTTPException(status_code=422, detail="Dentist not found in this clinic")
 
 
+def _require_patient_of_clinic(patient_user_id: int, clinic_id: int) -> None:
+    """
+    El paciente también tiene que ser de esta clínica. Era la asimetría del alta: el
+    odontólogo se validaba y el paciente no, así que un id inventado dejaba un turno con un
+    paciente que no existe —basura en la agenda— y, con `patient_email`, permitía disparar
+    invitaciones de Google Calendar hacia direcciones arbitrarias desde el calendario del
+    profesional.
+    """
+    if _clinic_of_user(int(patient_user_id)) != int(clinic_id):
+        raise HTTPException(status_code=422, detail="Patient not found in this clinic")
+
+
 def _validate_times(start: datetime, end: datetime) -> None:
     s, e = _naive(start), _naive(end)
     if e <= s:
@@ -125,8 +144,23 @@ def _validate_times(start: datetime, end: datetime) -> None:
         raise HTTPException(status_code=422, detail="Appointment duration cannot exceed 8 hours")
 
 
-def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
-                   start: datetime, end: datetime, exclude_id: int | None = None) -> None:
+# Los dialectos que soportan `SELECT … FOR UPDATE`. MariaDB lo soporta igual que MySQL pero
+# SQLAlchemy lo reporta con OTRO nombre: con `== 'mysql'` a secas, cambiar la cadena de conexión
+# a `mariadb+pymysql://` apagaba el lock EN SILENCIO.
+DIALECTOS_CON_LOCK = ("mysql", "mariadb")
+
+
+def _armar_query_solapamiento(db, dentist_user_id: int, clinic_id: int,
+                              start: datetime, end: datetime,
+                              exclude_id: int | None, dialecto: str):
+    """
+    La consulta que busca turnos pisados, separada para poder probarla sin base de datos.
+
+    El lock pesimista sólo corre en MySQL/MariaDB y los tests corren en SQLite, así que la
+    protección contra la carrera entre dos reservas simultáneas NO se ejecuta nunca en la
+    suite: se podía borrar entera y todo quedaba en verde. Con el dialecto como parámetro, el
+    test compila la consulta contra MySQL y exige que el `FOR UPDATE` esté.
+    """
     # Sólo los estados ACTIVOS ocupan el hueco: un cancelado, un ausente o un atendido no
     # bloquean que se agende otro turno en ese horario.
     filters = [
@@ -134,20 +168,30 @@ def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
         Appointment.clinic_id == clinic_id,
         Appointment.status.in_(list(ACTIVE_STATUSES)),
         Appointment.deleted_at.is_(None),
+        # Pegados no se pisan: uno que termina 15:00 y otro que empieza 15:00 conviven.
         Appointment.start_time_utc < end,
         Appointment.end_time_utc > start,
     ]
     if exclude_id:
+        # Mover un turno dentro de su propio horario no puede chocar contra sí mismo.
         filters.append(Appointment.appointment_id != exclude_id)
 
-    query = db.query(Appointment).filter(and_(*filters))
+    sesion = db if db is not None else Session()
+    query = sesion.query(Appointment).filter(and_(*filters))
 
-    # Pessimistic lock en MySQL para prevenir race conditions bajo carga concurrente.
-    # SQLite (tests) no soporta FOR UPDATE — se detecta por el dialecto del engine.
     # ⚠️ El lock vive hasta el commit: entre este chequeo y el commit del turno NO puede
     # haber ningún otro commit (la sync con Google, por ejemplo). Ver update_appointment.
-    if hasattr(db, 'bind') and db.bind is not None and db.bind.dialect.name == 'mysql':
+    if dialecto in DIALECTOS_CON_LOCK:
         query = query.with_for_update()
+    return query
+
+
+def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
+                   start: datetime, end: datetime, exclude_id: int | None = None) -> None:
+    dialecto = db.bind.dialect.name if getattr(db, "bind", None) is not None else ""
+    query = _armar_query_solapamiento(
+        db, dentist_user_id, clinic_id, _naive(start), _naive(end), exclude_id, dialecto,
+    )
 
     if query.first():
         raise HTTPException(
@@ -271,7 +315,8 @@ def _add_audit(db: Session, apt: Appointment, user_id: int,
 # Endpoints
 # ---------------------------------------------------------------------------
 
-@router.get("/availability/dentist/{dentist_id}")
+@router.get("/availability/dentist/{dentist_id}",
+            dependencies=[require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("30/minute")
 async def get_dentist_availability(
     request: Request,
@@ -280,9 +325,23 @@ async def get_dentist_availability(
     end: datetime,
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
-    user_id: int = Depends(get_user_id)
+    user_id: int = Depends(get_user_id),
+    roles: list[str] = Depends(get_roles),
 ):
-    """Bloques ocupados del odontólogo (Google Calendar + turnos locales)."""
+    """
+    Bloques ocupados del odontólogo (Google Calendar + turnos locales).
+
+    ⚠️ **Guard de rol obligatorio.** Los bloques salen del calendario `primary` de la cuenta
+    Google PERSONAL del odontólogo, no de una agenda dental aparte: sin guard, cualquier
+    PACIENTE de la clínica leía su vida privada. Filtrar por `clinic_id` no alcanza — un
+    paciente también trae `clinic_id` en su JWT. Es la clase del issue #261.
+
+    Y un odontólogo sólo puede consultar la suya: espiar la agenda de un colega no es parte
+    de su trabajo.
+    """
+    if ("ADMIN" not in roles and "RECEPTIONIST" not in roles and dentist_id != user_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     config = _get_dentist_config(db, dentist_id, clinic_id)
 
     if not config or not config.google_refresh_token:
@@ -332,9 +391,14 @@ async def get_upcoming_appointments(
         Appointment.status.in_(list(ACTIVE_STATUSES)),
         Appointment.start_time_utc >= now,
     ]
-    if "DENTIST" in roles and "ADMIN" not in roles:
+    # ⚠️ Falla CERRADO. La cadena de antes no tenía `else`, así que un token con un rol que
+    # este servicio no conoce —el quinto rol que alguien agregue— veía la agenda entera de la
+    # clínica. El default tiene que ser "sólo lo mío", como en `list_appointments`.
+    if "ADMIN" in roles or "RECEPTIONIST" in roles:
+        pass  # el staff de mostrador ve la agenda de toda la clínica
+    elif "DENTIST" in roles:
         filters.append(Appointment.dentist_user_id == user_id)
-    elif "PATIENT" in roles and "ADMIN" not in roles:
+    else:
         filters.append(Appointment.patient_user_id == user_id)
 
     appointments = (
@@ -365,10 +429,18 @@ async def list_appointments(
 ):
     """
     Lista turnos de la clínica con filtros opcionales.
-    patient_user_id: ADMIN/DENTIST/RECEPTIONIST pueden filtrar por paciente
-    (ej. para mostrar turnos en la historia clínica del paciente).
-    dentist_user_id: filtrar la agenda por profesional (columna de la recepcionista).
-    Un DENTIST sigue viendo sólo los suyos: el filtro se suma, no reemplaza al scoping.
+
+    `dentist_user_id`: filtrar la agenda por profesional (la columna de la recepcionista). Se
+    SUMA al alcance: un odontólogo que filtre por un colega sigue sin ver nada ajeno.
+
+    `patient_user_id`: la solapa Turnos de la historia clínica. Acá el alcance por profesional
+    **no se aplica a propósito**: el odontólogo que abre la ficha de un paciente necesita su
+    historial de visitas completo, no sólo las suyas — una historia clínica a medias es peor
+    que ninguna. No es una fuga: ese profesional ya puede abrir la ficha de cualquier paciente
+    de su clínica, así que no accede a nada que no tuviera.
+
+    ⚠️ Acá decía que el filtro "se suma, no reemplaza al scoping", que es lo contrario de lo
+    que hace el código. Lo fija `test_permisos_turnos.py`, en las dos direcciones.
     """
     filters = [Appointment.clinic_id == clinic_id]
 
@@ -434,20 +506,38 @@ async def create_appointment(
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
     user_id: int = Depends(get_user_id),
+    roles: list[str] = Depends(get_roles),
 ):
     """
     Crea un turno confirmado (SCHEDULED).
-    Solo ADMIN o RECEPTIONIST pueden crear turnos.
+
+    Lo crean ADMIN, RECEPTIONIST y DENTIST. El odontólogo **sólo en su propia agenda**: el
+    mostrador agenda para todos, el profesional para sí mismo.
+
     Si el odontólogo tiene Google Calendar conectado:
       - El turno se guarda en su GCal.
       - Si se provee patient_email, el paciente recibe una invitación automática.
     Si no tiene GCal conectado, el turno queda solo en nuestra base de datos.
     """
+    # ⚠️ Sin este freno un odontólogo escribía en la agenda de un colega: le ocupaba el hueco
+    # y le creaba un evento en su Google personal con invitación por mail — y después ni
+    # siquiera podía leer el turno (el GET le da 403), así que no tenía cómo deshacerlo.
+    # El PUT ya lo prohibía; el POST no.
+    if ("ADMIN" not in roles and "RECEPTIONIST" not in roles
+            and apt_data.dentist_user_id != user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Un odontólogo sólo puede crear turnos en su propia agenda",
+        )
+
     _require_dentist_of_clinic(apt_data.dentist_user_id, clinic_id)
+    _require_patient_of_clinic(apt_data.patient_user_id, clinic_id)
     config = _get_dentist_config(db, apt_data.dentist_user_id, clinic_id)
 
-    start = apt_data.start_time_utc
-    end = _resolve_end_time(start, apt_data.end_time_utc, config)
+    # A UTC naive ANTES de validar, chequear y guardar: si se guarda el valor con huso, la
+    # columna se queda con el reloj de pared y el turno entra corrido (ver `_naive`).
+    start = _naive(apt_data.start_time_utc)
+    end = _naive(_resolve_end_time(start, apt_data.end_time_utc, config))
     _validate_times(start, end)
     _check_overlap(db, apt_data.dentist_user_id, clinic_id, start, end)
 
@@ -528,10 +618,18 @@ async def update_appointment(
     if dentist_changed:
         _require_dentist_of_clinic(new_dentist, clinic_id)
 
-    new_start = _naive(update_data.start_time_utc) if update_data.start_time_utc else apt.start_time_utc
-    new_end   = _naive(update_data.end_time_utc)   if update_data.end_time_utc   else apt.end_time_utc
-    times_changed = bool(update_data.start_time_utc or update_data.end_time_utc)
     old_start, old_end = apt.start_time_utc, apt.end_time_utc
+    new_start = _naive(update_data.start_time_utc) if update_data.start_time_utc else old_start
+    if update_data.end_time_utc:
+        new_end = _naive(update_data.end_time_utc)
+    elif update_data.start_time_utc:
+        # Correr el inicio sin decir nada del fin MUEVE el turno: conserva su duración. Antes
+        # se quedaba con el fin viejo, así que adelantarlo media hora lo hacía durar el doble
+        # y bloqueaba agenda que nadie pidió bloquear.
+        new_end = new_start + (old_end - old_start)
+    else:
+        new_end = old_end
+    times_changed = bool(update_data.start_time_utc or update_data.end_time_utc)
 
     if times_changed:
         _validate_times(new_start, new_end)
@@ -574,12 +672,18 @@ async def update_appointment(
 
     config = _get_dentist_config(db, apt.dentist_user_id, clinic_id)
     if dentist_changed:
-        if old_event_id and not _delete_google_event_from(old_config, old_event_id, apt.appointment_id):
-            # El id viejo quedó en la auditoría; el evento huérfano se limpia a mano.
-            apt.gcal_sync_status = GcalSyncStatus.FAILED
-            db.commit()
+        quedo_huerfano = bool(old_event_id) and not _delete_google_event_from(
+            old_config, old_event_id, apt.appointment_id
+        )
         # Evento nuevo en el calendario del odontólogo nuevo (con invitación al paciente).
         _sync_to_gcal(db, apt, config, apt.patient_email, action="create")
+        if quedo_huerfano:
+            # ⚠️ Va DESPUÉS de crear el evento nuevo, no antes: `_sync_to_gcal` deja SYNCED al
+            # crear y pisaba este FAILED. El evento viejo sigue vivo en el calendario del
+            # odontólogo anterior —el paciente aparece con dos citas— y el único rastro que ve
+            # la recepcionista es este estado. El id viejo queda en la auditoría.
+            apt.gcal_sync_status = GcalSyncStatus.FAILED
+            db.commit()
     else:
         _sync_to_gcal(db, apt, config, patient_email=None, action="update")
 
