@@ -581,6 +581,175 @@ def test_quien_tiene_un_turno_que_pisa_el_hueco_no_es_candidato(receptionist_cli
     assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
 
 
+def test_un_turno_mas_largo_que_el_hueco_se_adelanta_solo_si_entra(receptionist_client):
+    """
+    Adelantar conserva la duración: un turno de una hora no cabe en un hueco de media si la media
+    hora siguiente está ocupada. Ofrecérselo terminaba en «horario ocupado» después de haberle
+    escrito al paciente.
+    """
+    inicio = _utc(10)
+    no_entra = _turno(_utc(20), minutos=60, dentist=1, paciente=6)
+    _turno(_utc(21), minutos=30, dentist=1, paciente=7)
+    no_entra_entrada = _id_anotado(receptionist_client, 6, dentist=1)
+    entra = _id_anotado(receptionist_client, 7, dentist=1)
+    sin_turno = _id_anotado(receptionist_client, 8, dentist=1)
+    _turno(inicio + timedelta(minutes=30), dentist=1, paciente=9)   # la media hora siguiente
+
+    apt = _turno(inicio, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert [c["entry_id"] for c in hueco["candidates"]] == [entra, sin_turno]
+
+    # La regla es la del cambio de horario: moverlo ahí da 409 de verdad.
+    res = receptionist_client.put(f"{BASE}/{no_entra}", json={
+        "start_time_utc": inicio.isoformat(), "waitlist_entry_id": no_entra_entrada,
+    })
+    assert res.status_code == 409
+
+
+def test_lo_que_no_ocupa_el_horario_siguiente_no_le_impide_entrar(receptionist_client):
+    """Un cancelado, un borrado, el turno de un colega o el de otra clínica a esa hora no tapan nada."""
+    inicio = _utc(10)
+    siguiente = inicio + timedelta(minutes=30)
+    su_turno = _turno(_utc(20), minutos=60, dentist=1, paciente=6)
+    entrada = _id_anotado(receptionist_client, 6, dentist=1)
+    _turno(siguiente, dentist=1, paciente=9, estado=AppointmentStatus.CANCELLED)
+    _turno(siguiente, dentist=2, paciente=9)
+    _turno(siguiente, dentist=1, paciente=9, clinica=2)
+    borrado = _turno(siguiente, dentist=1, paciente=9)
+    db = _db()
+    db.get(Appointment, borrado).deleted_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.commit()
+    db.close()
+
+    apt = _turno(inicio, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    [candidato] = hueco["candidates"]
+    assert candidato["entry_id"] == entrada
+    assert candidato["next_appointment"]["appointment_id"] == su_turno
+
+    res = receptionist_client.put(f"{BASE}/{su_turno}", json={
+        "start_time_utc": inicio.isoformat(), "waitlist_entry_id": entrada,
+    })
+    assert res.status_code == 200, res.text
+
+
+def test_su_propio_turno_pegado_al_hueco_no_le_impide_entrar(receptionist_client):
+    """El turno que se adelanta no choca consigo mismo: el cambio de horario también lo excluye."""
+    inicio = _utc(10)
+    su_turno = _turno(inicio + timedelta(minutes=30), minutos=60, dentist=1, paciente=6)
+    entrada = _id_anotado(receptionist_client, 6, dentist=1)
+    apt = _turno(inicio, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert [c["next_appointment"]["appointment_id"] for c in hueco["candidates"]] == [su_turno]
+
+    res = receptionist_client.put(f"{BASE}/{su_turno}", json={
+        "start_time_utc": inicio.isoformat(), "waitlist_entry_id": entrada,
+    })
+    assert res.status_code == 200, res.text
+
+
+def test_no_se_le_adelanta_encima_de_otro_turno_suyo(receptionist_client):
+    """
+    Otro turno del mismo paciente, con otro odontólogo, en la media hora siguiente: el cambio de
+    horario no lo frena (mira la agenda del odontólogo), pero el paciente quedaría en dos lados.
+    """
+    inicio = _utc(10)
+    _turno(_utc(20), minutos=60, dentist=1, paciente=6)
+    _turno(inicio + timedelta(minutes=30), dentist=2, paciente=6)
+    _id_anotado(receptionist_client, 6, dentist=1)
+    apt = _turno(inicio, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+    assert len(_abiertos()) == 1   # el aviso existe: lo que falta es a quién ofrecérselo
+    assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+
+
+def test_adelantar_a_otro_odontologo_mira_la_agenda_del_odontologo_del_hueco(receptionist_client):
+    """
+    Espera a cualquiera y su turno es con el odontólogo 2; el hueco es del 1. Adelantarlo lo pasa
+    al 1, así que lo que tiene que estar libre después del hueco es la agenda del 1, no la del 2.
+    """
+    inicio = _utc(10)
+    siguiente = inicio + timedelta(minutes=30)
+    su_turno = _turno(_utc(20), minutos=60, dentist=2, paciente=6)
+    entrada = _id_anotado(receptionist_client, 6)                  # cualquier odontólogo
+    _turno(siguiente, dentist=2, paciente=9)                       # el 2 ocupado después: no importa
+    apt = _turno(inicio, dentist=1, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert [c["next_appointment"]["appointment_id"] for c in hueco["candidates"]] == [su_turno]
+
+    # Se ocupa el 1 a la media hora: ya no entra, y el cambio de horario lo confirma.
+    _turno(siguiente, dentist=1, paciente=10)
+    assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+    res = receptionist_client.put(f"{BASE}/{su_turno}", json={
+        "start_time_utc": inicio.isoformat(), "dentist_user_id": 1, "waitlist_entry_id": entrada,
+    })
+    assert res.status_code == 409
+
+
+def test_los_avisos_que_nadie_ve_no_tapan_a_uno_que_si_sirve(receptionist_client, monkeypatch):
+    """
+    El tope cuenta avisos que alguien ve. Con tope 1: el primero sólo lo «quiere» un paciente que ya
+    tiene un turno antes (la consulta no lo sabe, se decide en Python), así que no lo ve nadie ni
+    lo descarta nadie. No puede dejar afuera al segundo, que sí tiene a quién ofrecérselo.
+    """
+    monkeypatch.setattr(lista_espera, "LIMITE_AVISOS", 1)
+    _turno(_utc(5), dentist=1, paciente=6)                          # 6 ya tiene uno antes de los dos
+    _id_anotado(receptionist_client, 6, dentist=1)
+    para_el_segundo = _id_anotado(receptionist_client, 7, dentist=1, desde=_utc(11, 0))
+    primero = _turno(_utc(10), paciente=5)
+    segundo = _turno(_utc(12), paciente=5)
+    for apt in (primero, segundo):
+        assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert hueco["start_time_utc"].startswith(_utc(12).isoformat()[:16])
+    assert [c["entry_id"] for c in hueco["candidates"]] == [para_el_segundo]
+
+
+def test_la_tanda_siguiente_no_saltea_un_aviso_a_la_misma_hora(receptionist_client, monkeypatch):
+    """
+    Dos avisos a la misma hora (dos odontólogos) caen en tandas distintas: la siguiente arranca
+    después del último por hora Y por id. Sólo por hora, el segundo no aparecía nunca.
+    """
+    monkeypatch.setattr(lista_espera, "LIMITE_AVISOS", 1)
+    inicio = _utc(10)
+    _turno(_utc(5), dentist=1, paciente=6)                  # 6 ya tiene uno antes: no quiere el del 1
+    _id_anotado(receptionist_client, 6, dentist=1)
+    para_el_dos = _id_anotado(receptionist_client, 7, dentist=2)
+    del_uno = _turno(inicio, dentist=1, paciente=5)
+    del_dos = _turno(inicio, dentist=2, paciente=8)
+    for apt in (del_uno, del_dos):                           # el del 1 queda con el id menor
+        assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert hueco["dentist_user_id"] == 2
+    assert [c["entry_id"] for c in hueco["candidates"]] == [para_el_dos]
+
+
+def test_la_busqueda_de_avisos_visibles_tiene_cota(receptionist_client, monkeypatch):
+    """Se miran como mucho TANDAS_MAXIMAS tandas: sin cota, cada recarga recorría todos los avisos."""
+    monkeypatch.setattr(lista_espera, "LIMITE_AVISOS", 1)
+    monkeypatch.setattr(lista_espera, "TANDAS_MAXIMAS", 1)
+    _turno(_utc(5), dentist=1, paciente=6)
+    _id_anotado(receptionist_client, 6, dentist=1)
+    _id_anotado(receptionist_client, 7, dentist=1, desde=_utc(11, 0))
+    for dia in (10, 12):
+        apt = _turno(_utc(dia), paciente=5)
+        assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+    assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+
+    monkeypatch.setattr(lista_espera, "TANDAS_MAXIMAS", 2)
+    assert len(receptionist_client.get(f"{W}/slots").json()["slots"]) == 1
+
+
 def test_un_hueco_ocupado_descartado_o_pasado_no_se_muestra(receptionist_client):
     _id_anotado(receptionist_client, 6)
 
@@ -858,6 +1027,31 @@ def test_un_turno_con_fecha_imposible_tambien_es_422(receptionist_client):
         "dentist_user_id": 1, "patient_user_id": 6, "start_time_utc": "9999-12-31T23:59:59-14:00",
     })
     assert res.status_code == 422
+
+
+@pytest.mark.parametrize("campo, largo", [
+    ("patient_phone", 50), ("patient_dni", 50), ("patient_timezone", 50),
+    ("patient_name", 255), ("patient_email", 255), ("patient_address", 255),
+])
+def test_un_dato_del_paciente_mas_largo_que_su_columna_es_422(receptionist_client, campo, largo):
+    """
+    La ficha del paciente acepta, por ejemplo, un teléfono con dos números y una aclaración; la
+    columna del turno tiene 50. En MySQL estricto eso era un 500 al darle el turno desde la lista
+    de espera (SQLite no hace cumplir el largo: sin el tope en el esquema, acá daba 200).
+    """
+    inicio = _utc(10)
+    cuerpo = {
+        "dentist_user_id": 1, "patient_user_id": 6,
+        "start_time_utc": inicio.isoformat(), "end_time_utc": (inicio + timedelta(minutes=30)).isoformat(),
+    }
+    valor = "a" * (largo - 6) + "@x.com" if campo == "patient_email" else "1" * largo
+    assert receptionist_client.post(f"{BASE}/", json={**cuerpo, campo: valor}).status_code == 200
+
+    otro = _utc(11)
+    cuerpo.update(start_time_utc=otro.isoformat(), end_time_utc=(otro + timedelta(minutes=30)).isoformat())
+    res = receptionist_client.post(f"{BASE}/", json={**cuerpo, campo: "a" + valor})
+    assert res.status_code == 422
+    assert f"at most {largo} characters" in res.text
 
 
 @pytest.mark.parametrize("desde", ["SCHEDULED", "CONFIRMED", "ARRIVED"])

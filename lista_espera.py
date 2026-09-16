@@ -36,6 +36,10 @@ DURACION_MAXIMA_TURNO = timedelta(hours=8)
 # por cada turno movido hacía crecer la consulta sin límite.
 LIMITE_AVISOS = 50
 
+# Cuántas tandas de LIMITE_AVISOS avisos se miran como mucho para juntar los que alguien ve: una
+# cota para que una clínica con cientos de avisos sin candidatos no recorra todos en cada recarga.
+TANDAS_MAXIMAS = 10
+
 
 def ahora_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)  # la base guarda UTC naive
@@ -230,6 +234,38 @@ def proximos_turnos(db: Session, *, clinic_id: int, entradas: list[WaitlistEntry
     return {e.entry_id: _proximo_turno(e, por_paciente.get(e.patient_user_id, []), ahora) for e in entradas}
 
 
+def _agenda_alrededor_del_hueco(db: Session, clinic_id: int, aviso: FreedSlot) -> list[Appointment]:
+    """
+    Los turnos activos del odontólogo del hueco que un turno adelantado podría pisar: uno movido
+    al comienzo del hueco dura como mucho 8 h, así que termina antes de las 8 h siguientes.
+    La cota de abajo no cambia el resultado, acota el índice (ver `_avisos_abiertos_que_pisan`).
+    """
+    return (
+        _turnos_activos(db, clinic_id)
+        .filter(and_(
+            Appointment.dentist_user_id == aviso.dentist_user_id,
+            Appointment.start_time_utc >= aviso.start_time_utc - DURACION_MAXIMA_TURNO,
+            Appointment.start_time_utc < aviso.start_time_utc + DURACION_MAXIMA_TURNO,
+            Appointment.end_time_utc > aviso.start_time_utc,
+        ))
+        .all()
+    )
+
+
+def _entra_adelantado(proximo: Appointment, inicio: datetime, fin: datetime,
+                      agenda: list[Appointment], turnos_del_paciente: list[Appointment]) -> bool:
+    """
+    Si el turno, movido a `inicio` con su duración (hasta `fin`), no pisa otro turno del
+    odontólogo del hueco ni otro del mismo paciente. Él mismo no cuenta: es el que se mueve, y
+    el cambio de horario lo excluye igual al buscar solapamientos.
+    """
+    return not any(
+        _se_pisan(t.start_time_utc, t.end_time_utc, inicio, fin)
+        for t in (*agenda, *turnos_del_paciente)
+        if t.appointment_id != proximo.appointment_id
+    )
+
+
 @dataclass
 class HuecoConCandidatos:
     aviso: FreedSlot
@@ -241,10 +277,14 @@ class HuecoConCandidatos:
 
 
 def armar_query_avisos(db: Session, *, clinic_id: int, roles: list[str], user_id: int,
-                       ahora: datetime, slot_id: Optional[int] = None):
+                       ahora: datetime, slot_id: Optional[int] = None,
+                       despues_de: Optional[tuple[datetime, int]] = None):
     """
     Los avisos que el cartel puede mostrar, filtrados EN LA BASE: abiertos, que no empezaron,
     que siguen libres y con al menos una entrada que en principio lo quiera.
+
+    `despues_de`: `(start_time_utc, slot_id)` del último aviso de la tanda anterior; la consulta
+    sigue desde ahí, en el mismo orden (ver `huecos_con_candidatos`).
 
     ⚠️ Antes esto se calculaba en Python: se traían todos los avisos abiertos y todos los turnos
     entre el primero y el último, y se comparaban de a pares. Un solo aviso a un año traía la
@@ -277,8 +317,56 @@ def armar_query_avisos(db: Session, *, clinic_id: int, roles: list[str], user_id
         query = query.filter(FreedSlot.dentist_user_id == user_id)
     if slot_id is not None:
         query = query.filter(FreedSlot.slot_id == slot_id)
+    if despues_de is not None:
+        inicio, ultimo_id = despues_de
+        query = query.filter(or_(
+            FreedSlot.start_time_utc > inicio,
+            and_(FreedSlot.start_time_utc == inicio, FreedSlot.slot_id > ultimo_id),
+        ))
     # El `slot_id` desempata dos avisos a la misma hora (dos odontólogos): ver `entradas_esperando`.
     return query.order_by(FreedSlot.start_time_utc.asc(), FreedSlot.slot_id.asc())
+
+
+def _candidatos_del_aviso(db: Session, *, clinic_id: int, aviso: FreedSlot, entradas: list[WaitlistEntry],
+                          por_paciente: dict[int, list[Appointment]], paciente_que_libero: dict[int, int],
+                          ahora: datetime, propio: bool, user_id: int) -> Optional[HuecoConCandidatos]:
+    """Un aviso con quiénes lo quieren, o None si quien pide no ve a ninguno. Ver `huecos_con_candidatos`."""
+    todos = []
+    # Se pide sólo si algún candidato tiene un turno más largo que el hueco: lo normal es que no
+    # haga falta.
+    agenda = None
+    for entrada in entradas:
+        if entrada.dentist_user_id is not None and entrada.dentist_user_id != aviso.dentist_user_id:
+            continue
+        if entrada.available_from_utc > aviso.start_time_utc:
+            continue
+        if entrada.patient_user_id == paciente_que_libero.get(aviso.source_appointment_id):
+            continue
+        turnos = por_paciente.get(entrada.patient_user_id, [])
+        # Incluye al turno que se adelantaría, a propósito: si ya ocupa parte del hueco (con otro
+        # odontólogo, porque con el mismo el hueco no estaría libre), ese horario ya lo tiene.
+        # Correrlo unos minutos no es darle un turno antes.
+        if any(_se_pisan(t.start_time_utc, t.end_time_utc, aviso.start_time_utc, aviso.end_time_utc)
+               for t in turnos):
+            continue
+        proximo = _proximo_turno(entrada, turnos, ahora)
+        if proximo is not None and proximo.start_time_utc <= aviso.start_time_utc:
+            continue
+        if proximo is not None:
+            fin = aviso.start_time_utc + (proximo.end_time_utc - proximo.start_time_utc)
+            # Hasta el fin del hueco está libre (lo garantiza la consulta de avisos) y el paciente
+            # ya se miró contra el hueco: sólo hay que mirar lo que sobra.
+            if fin > aviso.end_time_utc:
+                if agenda is None:
+                    agenda = _agenda_alrededor_del_hueco(db, clinic_id, aviso)
+                if not _entra_adelantado(proximo, aviso.start_time_utc, fin, agenda, turnos):
+                    continue
+        todos.append((entrada, proximo))
+
+    visibles = [c for c in todos if not propio or c[0].dentist_user_id == user_id]
+    if not visibles:
+        return None
+    return HuecoConCandidatos(aviso=aviso, candidatos=visibles, puede_descartar=len(visibles) == len(todos))
 
 
 def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user_id: int,
@@ -290,63 +378,65 @@ def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user
     Un candidato es una entrada que espera a ese odontólogo o a cualquiera, desde un día que no
     es posterior al hueco, cuyo paciente no es el que lo liberó ni tiene ya un turno que lo pise,
     y que **no tiene un turno anterior al hueco**: si ya tiene uno antes, no lo quiere. Si tiene
-    uno posterior, viaja con él: es el que se adelanta.
+    uno posterior, viaja con él: es el que se adelanta, **y tiene que entrar**. Un turno de una
+    hora no cabe en un hueco de media si la media hora siguiente está ocupada: ofrecérselo
+    terminaba en un «horario ocupado» después de haberle escrito al paciente.
 
     Los candidatos se calculan contra la lista de TODA la clínica y después se filtra lo que ve
     quien pide: así se sabe si un odontólogo puede descartar el aviso sin quitárselo a la
     recepción.
+
+    ⚠️ **El tope cuenta avisos que alguien ve, no los que trae la consulta.** La consulta sólo sabe
+    que alguien «en principio» quiere cada aviso; lo de arriba (el que lo liberó, el que ya tiene
+    un turno antes, el que no entra) se decide acá y puede dejar sin candidatos a los primeros 50.
+    Como nadie los ve, nadie los descarta: tapaban para siempre a uno posterior que sí servía.
+    Se piden de a tandas, en orden, hasta juntar el tope o mirar `TANDAS_MAXIMAS`.
     """
     ahora = ahora or ahora_utc()
     limite = LIMITE_AVISOS if limite is None else limite
-    avisos = (
-        armar_query_avisos(db, clinic_id=clinic_id, roles=roles, user_id=user_id, ahora=ahora, slot_id=slot_id)
-        .limit(limite)
-        .all()
-    )
-    if not avisos:
-        return []
-
-    # La lista entera de la clínica, con los permisos de la recepción: ver el docstring.
-    entradas = entradas_esperando(db, clinic_id=clinic_id, roles=["RECEPTIONIST"], user_id=user_id)
-    por_paciente = _turnos_futuros_por_paciente(db, clinic_id, {e.patient_user_id for e in entradas}, ahora)
-
-    # El paciente de cada turno que liberó un hueco: a él no se le ofrece su propio horario.
-    paciente_que_libero = dict(
-        db.query(Appointment.appointment_id, Appointment.patient_user_id)
-        .filter(and_(
-            Appointment.clinic_id == clinic_id,
-            Appointment.appointment_id.in_(sorted({a.source_appointment_id for a in avisos})),
-        ))
-        .all()
-    )
     propio = solo_lo_suyo(roles)
-
+    entradas = None
+    por_paciente = None
     resultado = []
-    for aviso in avisos:
-        todos = []
-        for entrada in entradas:
-            if entrada.dentist_user_id is not None and entrada.dentist_user_id != aviso.dentist_user_id:
-                continue
-            if entrada.available_from_utc > aviso.start_time_utc:
-                continue
-            if entrada.patient_user_id == paciente_que_libero.get(aviso.source_appointment_id):
-                continue
-            turnos = por_paciente.get(entrada.patient_user_id, [])
-            if any(_se_pisan(t.start_time_utc, t.end_time_utc, aviso.start_time_utc, aviso.end_time_utc)
-                   for t in turnos):
-                continue
-            proximo = _proximo_turno(entrada, turnos, ahora)
-            if proximo is not None and proximo.start_time_utc <= aviso.start_time_utc:
-                continue
-            todos.append((entrada, proximo))
+    despues_de = None
+    for _ in range(TANDAS_MAXIMAS):
+        avisos = (
+            armar_query_avisos(db, clinic_id=clinic_id, roles=roles, user_id=user_id, ahora=ahora,
+                               slot_id=slot_id, despues_de=despues_de)
+            .limit(limite)
+            .all()
+        )
+        if not avisos:
+            break
+        if entradas is None:
+            # La lista entera de la clínica, con los permisos de la recepción: ver el docstring.
+            entradas = entradas_esperando(db, clinic_id=clinic_id, roles=["RECEPTIONIST"], user_id=user_id)
+            por_paciente = _turnos_futuros_por_paciente(
+                db, clinic_id, {e.patient_user_id for e in entradas}, ahora,
+            )
 
-        visibles = [c for c in todos if not propio or c[0].dentist_user_id == user_id]
-        if visibles:
-            resultado.append(HuecoConCandidatos(
-                aviso=aviso,
-                candidatos=visibles,
-                puede_descartar=len(visibles) == len(todos),
+        # El paciente de cada turno que liberó un hueco: a él no se le ofrece su propio horario.
+        paciente_que_libero = dict(
+            db.query(Appointment.appointment_id, Appointment.patient_user_id)
+            .filter(and_(
+                Appointment.clinic_id == clinic_id,
+                Appointment.appointment_id.in_(sorted({a.source_appointment_id for a in avisos})),
             ))
+            .all()
+        )
+        for aviso in avisos:
+            hueco = _candidatos_del_aviso(
+                db, clinic_id=clinic_id, aviso=aviso, entradas=entradas, por_paciente=por_paciente,
+                paciente_que_libero=paciente_que_libero, ahora=ahora, propio=propio, user_id=user_id,
+            )
+            if hueco is not None:
+                resultado.append(hueco)
+                if len(resultado) == limite:
+                    return resultado
+
+        if len(avisos) < limite:
+            break
+        despues_de = (avisos[-1].start_time_utc, avisos[-1].slot_id)
     return resultado
 
 

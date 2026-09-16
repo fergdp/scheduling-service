@@ -65,14 +65,17 @@ class AppointmentBase(BaseModel):
 class AppointmentCreate(BaseModel):
     dentist_user_id: int = Field(gt=0)
     patient_user_id: int = Field(gt=0)
-    patient_name: Optional[str] = None
-    patient_email: Optional[str] = None
-    patient_phone: Optional[str] = None
-    patient_dni: Optional[str] = None
-    patient_address: Optional[str] = None
+    # Los topes son los de las columnas. Sin ellos, un dato más largo —un teléfono con dos números y
+    # una aclaración, que la ficha del paciente acepta— llegaba a MySQL y el alta daba 500 en vez
+    # de un 422 que se pueda explicar (salió con «Darle el turno» desde la lista de espera, #298).
+    patient_name: Optional[str] = Field(default=None, max_length=255)
+    patient_email: Optional[str] = Field(default=None, max_length=255)
+    patient_phone: Optional[str] = Field(default=None, max_length=50)
+    patient_dni: Optional[str] = Field(default=None, max_length=50)
+    patient_address: Optional[str] = Field(default=None, max_length=255)
     start_time_utc: datetime
     end_time_utc: Optional[datetime] = None  # si no se envía, usa la duración default del odontólogo
-    patient_timezone: str = "UTC"
+    patient_timezone: str = Field(default="UTC", max_length=50)
     reason: Optional[str] = None
     # Lista de espera (#298): el turno se le da a ese paciente de la lista, que sale de la lista
     # en el mismo commit. Opcional: sin esto el alta es la de siempre.
