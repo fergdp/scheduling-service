@@ -91,6 +91,22 @@ def _visibles(query):
     return query.filter(Appointment.deleted_at.is_(None))
 
 
+def _orden_de_la_lista(con_rango: bool) -> tuple:
+    """
+    Orden del listado: hacia adelante cuando se pide un rango (la agenda), hacia atrás si no (el
+    historial).
+
+    ⚠️ El `appointment_id` de desempate no es cosmético. Cinco odontólogos a las 09:00 son cinco
+    filas con el mismo horario, y con filas empatadas MySQL puede devolverlas en cualquier orden,
+    distinto según el `LIMIT`/`OFFSET` de cada pedido (lo advierte su manual, en "LIMIT Query
+    Optimization"). El calendario pagina (#288): sin desempate, un turno podía salir en dos
+    páginas y otro en ninguna. SQLite no lo reproduce, por eso el test mira la consulta.
+    """
+    if con_rango:
+        return (Appointment.start_time_utc.asc(), Appointment.appointment_id.asc())
+    return (Appointment.start_time_utc.desc(), Appointment.appointment_id.desc())
+
+
 def _load_appointment(db: Session, appointment_id: int, clinic_id: int) -> Appointment:
     """Turno de ESTA clínica, no borrado. 404 en cualquier otro caso (no se revela nada)."""
     apt = _visibles(db.query(Appointment).filter(
@@ -418,8 +434,12 @@ async def list_appointments(
     clinic_id: int = Depends(get_clinic_id),
     user_id: int = Depends(get_user_id),
     roles: list[str] = Depends(get_roles),
-    status: AppointmentStatus = Query(None),
-    # 500: una semana de 5 odontólogos a 24 turnos/día entra en una sola página.
+    # Repetible (#302): `?status=SCHEDULED&status=CONFIRMED` trae los de cualquiera de los dos.
+    # Un solo `?status=X` sigue funcionando igual.
+    status: Optional[list[AppointmentStatus]] = Query(None),
+    # 500 es el tope por página, no por consulta: un mes de 5 odontólogos no entra, y tampoco
+    # una semana con la agenda llena. El calendario pide las páginas que falten con `offset`
+    # (#288), y por eso el orden tiene desempate (`_orden_de_la_lista`).
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
     patient_user_id: Optional[int] = Query(None),
@@ -432,6 +452,9 @@ async def list_appointments(
 
     `dentist_user_id`: filtrar la agenda por profesional (la columna de la recepcionista). Se
     SUMA al alcance: un odontólogo que filtre por un colega sigue sin ver nada ajeno.
+
+    `status`: uno o varios estados (#302). «Por atender» son tres: programado, confirmado y en
+    espera.
 
     `patient_user_id`: la solapa Turnos de la historia clínica. Acá el alcance por profesional
     **no se aplica a propósito**: el odontólogo que abre la ficha de un paciente necesita su
@@ -461,18 +484,12 @@ async def list_appointments(
     if date_to:
         filters.append(Appointment.start_time_utc < _naive(date_to))
     if status:
-        filters.append(Appointment.status == status)
+        filters.append(Appointment.status.in_(status))
 
     query = _visibles(db.query(Appointment).filter(and_(*filters)))
     total = query.count()
-    # Orden ascendente cuando se filtra por fecha (agenda del día); descendente por defecto (historial)
-    order = (
-        Appointment.start_time_utc.asc()
-        if date_from is not None
-        else Appointment.start_time_utc.desc()
-    )
     appointments = (
-        query.order_by(order)
+        query.order_by(*_orden_de_la_lista(con_rango=date_from is not None))
         .offset(offset).limit(limit).all()
     )
     return {"appointments": appointments, "total": total}
