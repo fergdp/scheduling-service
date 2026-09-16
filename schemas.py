@@ -1,9 +1,9 @@
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from models import AppointmentStatus, GcalSyncStatus
+from models import AppointmentStatus, FreedSlotReason, GcalSyncStatus, WaitlistStatus
 
 # Forma mínima de un mail: algo, arroba, dominio con punto. No valida que exista.
 _FORMA_DE_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -19,7 +19,12 @@ def _a_utc(v: datetime) -> datetime:
     `2026-09-15T14:43-14:00` pasaba el validador (su instante real es futuro) y terminaba
     guardado diez horas en el pasado. Lo fija `tests/test_integridad_turnos.py`.
     """
-    return v.astimezone(timezone.utc) if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+    try:
+        return v.astimezone(timezone.utc) if v.tzinfo is not None else v.replace(tzinfo=timezone.utc)
+    except OverflowError:
+        # «9999-12-31T23:59:59-14:00» no entra en un datetime al pasarlo a UTC. Sin esto saltaba
+        # un OverflowError que Pydantic no convierte: 500 y un traceback en el log por pedido.
+        raise ValueError("date is out of range")
 
 
 class OAuthUrlResponse(BaseModel):
@@ -69,6 +74,9 @@ class AppointmentCreate(BaseModel):
     end_time_utc: Optional[datetime] = None  # si no se envía, usa la duración default del odontólogo
     patient_timezone: str = "UTC"
     reason: Optional[str] = None
+    # Lista de espera (#298): el turno se le da a ese paciente de la lista, que sale de la lista
+    # en el mismo commit. Opcional: sin esto el alta es la de siempre.
+    waitlist_entry_id: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("start_time_utc")
     @classmethod
@@ -117,6 +125,9 @@ class AppointmentUpdate(BaseModel):
     end_time_utc: Optional[datetime] = None
     reason: Optional[str] = None
     dentist_user_id: Optional[int] = Field(default=None, gt=0)
+    # Lista de espera (#298): «Adelantar su turno». El paciente del turno sale de la lista en el
+    # mismo commit en que su turno se mueve al hueco.
+    waitlist_entry_id: Optional[int] = Field(default=None, gt=0)
 
     @field_validator("start_time_utc")
     @classmethod
@@ -175,3 +186,133 @@ class AppointmentStatusUpdate(BaseModel):
 class AppointmentListResponse(BaseModel):
     appointments: list[AppointmentResponse]
     total: int
+
+
+# ---------------------------------------------------------------------------
+# Lista de espera (#298)
+# ---------------------------------------------------------------------------
+
+_NOTA_MAXIMA = 300
+
+
+# «Desde cuándo le sirve»: nada anterior al 2000 ni más allá de dos años. Sin cota entraban el
+# año 1 y el 9999, que no son una fecha que alguien quiera cargar sino un error o una prueba.
+_DESDE_MINIMO = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_DESDE_MAXIMO = timedelta(days=2 * 366)
+
+
+def _desde_razonable(v: datetime) -> datetime:
+    v = _a_utc(v)
+    if v < _DESDE_MINIMO or v > datetime.now(timezone.utc) + _DESDE_MAXIMO:
+        raise ValueError("available_from_utc is out of range")
+    return v
+
+
+def _normalizar_nota(v: Optional[str]) -> Optional[str]:
+    """Una nota en blanco no es una nota: se guarda NULL, no una cadena de espacios."""
+    if v is None:
+        return None
+    v = v.strip()
+    return v or None
+
+
+class WaitlistEntryCreate(BaseModel):
+    patient_user_id: int = Field(gt=0)
+    patient_name: Optional[str] = Field(default=None, max_length=255)
+    patient_phone: Optional[str] = Field(default=None, max_length=50)
+    # None = cualquier odontólogo.
+    dentist_user_id: Optional[int] = Field(default=None, gt=0)
+    # Desde cuándo le sirve: el comienzo del día elegido, en el huso de quien anota.
+    available_from_utc: datetime
+    note: Optional[str] = Field(default=None, max_length=_NOTA_MAXIMA)
+
+    @field_validator("available_from_utc")
+    @classmethod
+    def a_utc(cls, v: datetime) -> datetime:
+        return _desde_razonable(v)
+
+    @field_validator("note")
+    @classmethod
+    def nota(cls, v: Optional[str]) -> Optional[str]:
+        return _normalizar_nota(v)
+
+
+class WaitlistEntryUpdate(BaseModel):
+    """
+    Editar una entrada. Sólo se tocan los campos que vienen en el pedido: para pasar a
+    «cualquier odontólogo» se manda `dentist_user_id: null` explícito, y para borrar la nota,
+    `note: null`. Un campo que no viene queda como estaba.
+    """
+    dentist_user_id: Optional[int] = Field(default=None, gt=0)
+    available_from_utc: Optional[datetime] = None
+    note: Optional[str] = Field(default=None, max_length=_NOTA_MAXIMA)
+
+    @field_validator("available_from_utc")
+    @classmethod
+    def a_utc(cls, v: Optional[datetime]) -> Optional[datetime]:
+        return _desde_razonable(v) if v is not None else None
+
+    @field_validator("note")
+    @classmethod
+    def nota(cls, v: Optional[str]) -> Optional[str]:
+        return _normalizar_nota(v)
+
+    @model_validator(mode="after")
+    def desde_no_nulo(self):
+        # `available_from_utc` es obligatorio en la tabla: mandarlo en null explícito no puede
+        # significar «sin fecha».
+        if "available_from_utc" in self.model_fields_set and self.available_from_utc is None:
+            raise ValueError("available_from_utc cannot be null")
+        return self
+
+
+class AppointmentBrief(BaseModel):
+    """El turno que ya tiene un paciente de la lista: el que se le puede adelantar."""
+    appointment_id: int
+    dentist_user_id: int
+    start_time_utc: datetime
+    end_time_utc: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class WaitlistEntryResponse(BaseModel):
+    entry_id: int
+    patient_user_id: int
+    patient_name: Optional[str] = None
+    patient_phone: Optional[str] = None
+    dentist_user_id: Optional[int] = None
+    available_from_utc: datetime
+    note: Optional[str] = None
+    status: WaitlistStatus
+    appointment_id: Optional[int] = None
+    created_at: datetime
+    # En la lista: su próximo turno activo (con ese odontólogo, o con cualquiera si espera a
+    # cualquiera). Como candidato de un hueco: ese mismo turno, que por regla es POSTERIOR al
+    # hueco, o sea el que se adelanta. None si no tiene.
+    next_appointment: Optional[AppointmentBrief] = None
+
+
+class WaitlistListResponse(BaseModel):
+    entries: list[WaitlistEntryResponse]
+    total: int
+
+
+class FreedSlotResponse(BaseModel):
+    slot_id: int
+    dentist_user_id: int
+    start_time_utc: datetime
+    end_time_utc: datetime
+    reason: FreedSlotReason
+    created_at: datetime
+    # Si quien pide lo puede descartar. Un odontólogo no descarta un aviso que también tiene
+    # candidatos de la recepción (se lo cerraría a ella): el front esconde el botón.
+    can_dismiss: bool = True
+    candidates: list[WaitlistEntryResponse]
+
+
+class FreedSlotListResponse(BaseModel):
+    slots: list[FreedSlotResponse]
+    # Cuántos esperan (lo que ve quien pide), para el contador del botón: así la pantalla hace
+    # UN pedido por recarga y no dos.
+    waiting_count: int

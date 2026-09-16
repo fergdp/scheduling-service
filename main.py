@@ -223,10 +223,11 @@ async def root(request: Request):
     }
 
 # Router inclusion — health must be first (no rate limiter, no auth)
-from routers import oauth, appointments, health as health_router
+from routers import oauth, appointments, waitlist, health as health_router
 app.include_router(health_router.router)
 app.include_router(oauth.router, prefix="/clinic-scheduling-api/v1/oauth", tags=["OAuth"])
 app.include_router(appointments.router, prefix="/clinic-scheduling-api/v1/appointments", tags=["Appointments"])
+app.include_router(waitlist.router, prefix="/clinic-scheduling-api/v1/waitlist", tags=["Waitlist"])
 
 # Observabilidad (issue #75): métricas RED en /metrics para Prometheus.
 # En prod, PROMETHEUS_MULTIPROC_DIR (del supervisor) activa el modo multiproceso

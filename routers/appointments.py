@@ -9,9 +9,10 @@ from slowapi.util import get_remote_address
 from dependencies import (
     get_db, get_clinic_id, get_user_id, get_roles, require_any_role, _resolve_db_clinic_id,
 )
+import lista_espera
 from models import (
     Appointment, DentistCalendarConfig, AppointmentStatus, ACTIVE_STATUSES,
-    AppointmentAuditLog, GcalSyncStatus,
+    AppointmentAuditLog, FreedSlotReason, GcalSyncStatus,
 )
 from schemas import (
     AppointmentCreate, AppointmentUpdate, AppointmentResponse,
@@ -107,11 +108,27 @@ def _orden_de_la_lista(con_rango: bool) -> tuple:
     return (Appointment.start_time_utc.desc(), Appointment.appointment_id.desc())
 
 
-def _load_appointment(db: Session, appointment_id: int, clinic_id: int) -> Appointment:
-    """Turno de ESTA clínica, no borrado. 404 en cualquier otro caso (no se revela nada)."""
-    apt = _visibles(db.query(Appointment).filter(
+def _armar_query_turno(db, appointment_id: int, clinic_id: int, con_lock: bool):
+    """
+    La consulta de un turno, separada para poder probar el lock sin base (como el solapamiento).
+
+    ⚠️ Las mutaciones lo leen con `FOR UPDATE`. Sin lock, dos cambios a la vez sobre el mismo
+    turno decidían cada uno sobre una foto vieja: adelantarlo desde la lista de espera mientras el
+    paciente lo cancelaba desde el portal dejaba un turno CANCELADO movido al hueco, la entrada
+    resuelta y el aviso cerrado con el horario libre (#298, visto intercalando las transacciones).
+    """
+    sesion = db if db is not None else Session()
+    query = _visibles(sesion.query(Appointment).filter(
         and_(Appointment.appointment_id == appointment_id, Appointment.clinic_id == clinic_id)
-    )).first()
+    ))
+    if con_lock:
+        query = query.with_for_update()
+    return query
+
+
+def _load_appointment(db: Session, appointment_id: int, clinic_id: int, con_lock: bool = False) -> Appointment:
+    """Turno de ESTA clínica, no borrado. 404 en cualquier otro caso (no se revela nada)."""
+    apt = _armar_query_turno(db, appointment_id, clinic_id, con_lock).first()
     if not apt:
         raise HTTPException(status_code=404, detail="Appointment not found")
     return apt
@@ -202,11 +219,19 @@ def _armar_query_solapamiento(db, dentist_user_id: int, clinic_id: int,
     return query
 
 
+def _dialecto(db: Session) -> str:
+    return db.bind.dialect.name if getattr(db, "bind", None) is not None else ""
+
+
+def _con_lock(db: Session) -> bool:
+    """Si esta base soporta `SELECT … FOR UPDATE`. Aparte para que el test pueda forzarlo en SQLite."""
+    return _dialecto(db) in DIALECTOS_CON_LOCK
+
+
 def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
                    start: datetime, end: datetime, exclude_id: int | None = None) -> None:
-    dialecto = db.bind.dialect.name if getattr(db, "bind", None) is not None else ""
     query = _armar_query_solapamiento(
-        db, dentist_user_id, clinic_id, _naive(start), _naive(end), exclude_id, dialecto,
+        db, dentist_user_id, clinic_id, _naive(start), _naive(end), exclude_id, _dialecto(db),
     )
 
     if query.first():
@@ -332,7 +357,7 @@ def _add_audit(db: Session, apt: Appointment, user_id: int,
 # ---------------------------------------------------------------------------
 
 @router.get("/availability/dentist/{dentist_id}",
-            dependencies=[require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
+            dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("30/minute")
 async def get_dentist_availability(
     request: Request,
@@ -514,8 +539,10 @@ async def get_appointment(
     return apt
 
 
+# `get_clinic_id` antes que el guard de rol: sin sesión tiene que salir 401 (el front manda a
+# iniciar sesión), no el 403 de «roles vacíos». Lo mismo en el PUT y en la disponibilidad.
 @router.post("/", response_model=AppointmentResponse,
-             dependencies=[require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
+             dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("20/minute")
 async def create_appointment(
     request: Request,
@@ -556,6 +583,18 @@ async def create_appointment(
     start = _naive(apt_data.start_time_utc)
     end = _naive(_resolve_end_time(start, apt_data.end_time_utc, config))
     _validate_times(start, end)
+
+    # Lista de espera (#298): la entrada se toma ANTES del solapamiento, así una que ya no está
+    # disponible corta sin haber bloqueado la agenda. Su lock evita que dos personas le den dos
+    # turnos al mismo paciente a la vez.
+    entrada = None
+    if apt_data.waitlist_entry_id is not None:
+        entrada = lista_espera.tomar_entrada(
+            db, entry_id=apt_data.waitlist_entry_id, clinic_id=clinic_id,
+            patient_user_id=apt_data.patient_user_id, roles=roles, user_id=user_id,
+            con_lock=_con_lock(db),
+        )
+
     _check_overlap(db, apt_data.dentist_user_id, clinic_id, start, end)
 
     apt = Appointment(
@@ -574,6 +613,14 @@ async def create_appointment(
         status=AppointmentStatus.SCHEDULED,
     )
     db.add(apt)
+    if entrada is not None:
+        db.flush()  # el id del turno nuevo, para anotarlo en la entrada
+        lista_espera.resolver_entrada(entrada, appointment_id=apt.appointment_id, user_id=user_id)
+    # El horario se ocupó: si había un aviso de hueco liberado ahí, ya no hay nada que ofrecer.
+    lista_espera.cerrar_avisos_ocupados(
+        db, clinic_id=clinic_id, dentist_user_id=apt_data.dentist_user_id,
+        start=start, end=end, user_id=user_id,
+    )
     db.commit()
     db.refresh(apt)
 
@@ -592,7 +639,7 @@ async def create_appointment(
 
 
 @router.put("/{appointment_id}", response_model=AppointmentResponse,
-            dependencies=[require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
+            dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("20/minute")
 async def update_appointment(
     request: Request,
@@ -610,7 +657,14 @@ async def update_appointment(
     Cambiar de odontólogo: solapamiento contra el nuevo, y el evento de Google Calendar
     sale del calendario del anterior y entra al del nuevo (si lo tiene conectado).
     """
-    apt = _load_appointment(db, appointment_id, clinic_id)
+    # Lista de espera (#298): el lock de la entrada va ANTES que el del turno, en el mismo orden
+    # que el alta (ver `lista_espera`). Se valida más abajo, cuando ya se sabe de quién es el turno.
+    entrada_bloqueada = None
+    if update_data.waitlist_entry_id is not None:
+        entrada_bloqueada = lista_espera.bloquear_entrada(
+            db, entry_id=update_data.waitlist_entry_id, clinic_id=clinic_id, con_lock=_con_lock(db),
+        )
+    apt = _load_appointment(db, appointment_id, clinic_id, con_lock=_con_lock(db))
 
     # Autorización ANTES de cualquier validación: un 422 con detalle a quien no puede ni ver
     # el turno le contaría en qué estado está.
@@ -650,6 +704,21 @@ async def update_appointment(
 
     if times_changed:
         _validate_times(new_start, new_end)
+    movido = dentist_changed or new_start != old_start or new_end != old_end
+
+    # Lista de espera (#298), «Adelantar su turno»: el paciente de este turno sale de la lista en
+    # el mismo commit en que su turno se mueve. Sin movimiento no hay nada que adelantar.
+    entrada = None
+    if update_data.waitlist_entry_id is not None:
+        if not movido:
+            raise HTTPException(
+                status_code=422,
+                detail="Waiting list entry requires moving the appointment",
+            )
+        entrada = lista_espera.validar_entrada(
+            entrada_bloqueada, patient_user_id=apt.patient_user_id, roles=roles, user_id=user_id,
+        )
+
     if times_changed or dentist_changed:
         _check_overlap(db, new_dentist, clinic_id, new_start, new_end, exclude_id=appointment_id)
 
@@ -674,6 +743,24 @@ async def update_appointment(
             db, apt, user_id, apt.status.value, apt.status.value,
             reason=f"Horario cambiado: {old_start.isoformat()} → {new_start.isoformat()}",
         )
+
+    if movido:
+        # El horario viejo quedó libre: aviso para la lista de espera. Salvo que el turno siga
+        # pisándolo (lo corrieron un rato, o lo estiraron): ahí no se liberó un hueco que se
+        # pueda ofrecer. Y el horario nuevo se ocupó: sus avisos se cierran.
+        sigue_pisando = not dentist_changed and new_start < old_end and new_end > old_start
+        if not sigue_pisando:
+            lista_espera.registrar_hueco_liberado(
+                db, clinic_id=clinic_id, dentist_user_id=old_dentist, start=old_start, end=old_end,
+                source_appointment_id=apt.appointment_id, reason=FreedSlotReason.RESCHEDULED,
+                user_id=user_id,
+            )
+        lista_espera.cerrar_avisos_ocupados(
+            db, clinic_id=clinic_id, dentist_user_id=new_dentist, start=new_start, end=new_end,
+            user_id=user_id,
+        )
+    if entrada is not None:
+        lista_espera.resolver_entrada(entrada, appointment_id=apt.appointment_id, user_id=user_id)
 
     apt.start_time_utc = new_start
     apt.end_time_utc   = new_end
@@ -729,7 +816,7 @@ async def update_appointment_status(
     Google Calendar: CANCELLED borra el evento; volver a activo lo recrea si no existe;
     COMPLETED y NO_SHOW no lo tocan.
     """
-    apt = _load_appointment(db, appointment_id, clinic_id)
+    apt = _load_appointment(db, appointment_id, clinic_id, con_lock=_con_lock(db))
 
     new_status = status_update.status
     previous = apt.status
@@ -755,6 +842,23 @@ async def update_appointment_status(
 
     apt.status = new_status
     _add_audit(db, apt, user_id, previous.value, new_status.value, status_update.change_reason)
+
+    # Lista de espera (#298). Cancelar un turno que ocupaba el hueco lo libera, lo cancele quien
+    # lo cancele —también el paciente desde su portal, que es justo el caso del que nadie se
+    # enteraba—. Reactivarlo lo vuelve a ocupar, y así el Deshacer de una cancelación se lleva
+    # también el aviso. Ausente y atendido no avisan: son turnos del pasado.
+    if new_status == AppointmentStatus.CANCELLED and previous in ACTIVE_STATUSES:
+        lista_espera.registrar_hueco_liberado(
+            db, clinic_id=clinic_id, dentist_user_id=apt.dentist_user_id,
+            start=apt.start_time_utc, end=apt.end_time_utc,
+            source_appointment_id=apt.appointment_id, reason=FreedSlotReason.CANCELLED,
+            user_id=user_id,
+        )
+    elif new_status in ACTIVE_STATUSES and previous not in ACTIVE_STATUSES:
+        lista_espera.cerrar_avisos_ocupados(
+            db, clinic_id=clinic_id, dentist_user_id=apt.dentist_user_id,
+            start=apt.start_time_utc, end=apt.end_time_utc, user_id=user_id,
+        )
     db.commit()
     db.refresh(apt)
     logger.info(f"Appointment {appointment_id}: {previous.value} → {new_status.value} by user {user_id}")
@@ -784,7 +888,7 @@ async def delete_appointment(
     Staff (ADMIN, RECEPTIONIST, odontólogo asignado). Deja rastro en la auditoría y borra
     el evento de Google Calendar si existe. El turno deja de verse en todos los endpoints.
     """
-    apt = _load_appointment(db, appointment_id, clinic_id)
+    apt = _load_appointment(db, appointment_id, clinic_id, con_lock=_con_lock(db))
 
     if not _is_staff_for(apt, roles, user_id):
         raise HTTPException(status_code=403, detail="Access denied")
@@ -792,6 +896,18 @@ async def delete_appointment(
     apt.deleted_at = _utcnow_naive()
     apt.deleted_by_user_id = user_id
     _add_audit(db, apt, user_id, apt.status.value, "DELETED")
+    # Lista de espera (#298): borrar no avisa («lo cargué mal»). Y si algún aviso abierto quedó
+    # pisado por este turno —otra transacción lo registró mientras ésta esperaba su lock—, se
+    # cierra ahora: si no, reaparecería al desaparecer el turno que lo tapaba.
+    if apt.status in ACTIVE_STATUSES:
+        lista_espera.cerrar_avisos_ocupados(
+            db, clinic_id=clinic_id, dentist_user_id=apt.dentist_user_id,
+            start=apt.start_time_utc, end=apt.end_time_utc, user_id=user_id,
+        )
+    # Y los avisos que había dejado este turno (cancelado o movido antes): estaba mal cargado.
+    lista_espera.cerrar_avisos_del_turno_borrado(
+        db, clinic_id=clinic_id, appointment_id=apt.appointment_id, user_id=user_id,
+    )
     db.commit()
     logger.info(f"Appointment {appointment_id} deleted (soft) by user {user_id}")
 
