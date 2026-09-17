@@ -63,6 +63,18 @@ def dentistas_de_la_clinica_1(monkeypatch):
     import routers.appointments as ra
     monkeypatch.setattr(ra, "_clinic_of_user", lambda user_id: 1)
 
+
+@pytest.fixture(autouse=True)
+def sin_telefonos_vigentes(monkeypatch):
+    """
+    Las rutas de lectura piden el teléfono vigente a `users` de dental-clinic (#313), tabla que
+    la base de tests no tiene. Por defecto no hay ninguno vigente, así que las respuestas
+    devuelven el guardado en el turno —el comportamiento de siempre—; el test que prueba el
+    reemplazo pisa esto con un mapa explícito.
+    """
+    import routers.appointments as ra
+    monkeypatch.setattr(ra, "_telefonos_vigentes", lambda patient_user_ids: {})
+
 def _sembrar_csrf(c):
     """
     Deja al cliente con la cookie XSRF-TOKEN y el header X-XSRF-TOKEN puestos, que es

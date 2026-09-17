@@ -5,9 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from slowapi import Limiter
-from slowapi.util import get_remote_address
 from dependencies import (
     get_db, get_clinic_id, get_user_id, get_roles, require_any_role, _resolve_db_clinic_id,
+    telefonos_vigentes_de, key_por_usuario_o_ip,
 )
 import lista_espera
 from models import (
@@ -27,7 +27,9 @@ from utils.crypto import decrypt_token
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
+# Por usuario, no por IP (#303): ver key_por_usuario_o_ip. `routers/waitlist.py` importa este
+# mismo `limiter`, así que sus rutas quedan alcanzadas sin tocar nada ahí.
+limiter = Limiter(key_func=key_por_usuario_o_ip)
 
 _DEFAULT_DURATION_MINUTES = 30
 
@@ -39,6 +41,10 @@ _PATIENT_CANCELLABLE_FROM = (AppointmentStatus.SCHEDULED, AppointmentStatus.CONF
 # Es un nombre de módulo, no una llamada directa, para que los tests lo puedan reemplazar:
 # la base de tests no tiene la tabla `users`.
 _clinic_of_user = _resolve_db_clinic_id
+
+# Mismo motivo: el teléfono vigente de cada paciente (issue #313) sale de `users`, tabla que la
+# base de tests no tiene.
+_telefonos_vigentes = telefonos_vigentes_de
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +138,25 @@ def _load_appointment(db: Session, appointment_id: int, clinic_id: int, con_lock
     if not apt:
         raise HTTPException(status_code=404, detail="Appointment not found")
     return apt
+
+
+def _con_telefono_vigente(apt: Appointment, telefonos: dict) -> AppointmentResponse:
+    """
+    El turno como `AppointmentResponse`, con `patient_phone` reemplazado por el vigente si
+    `users` tiene uno (#313). Si no —paciente sin teléfono cargado hoy, o que ya no está en la
+    clínica—, se deja el que quedó guardado en el turno: mejor un número viejo que ninguno.
+    """
+    resp = AppointmentResponse.model_validate(apt)
+    vigente = telefonos.get(apt.patient_user_id)
+    if vigente:
+        resp.patient_phone = vigente
+    return resp
+
+
+def _con_telefonos_vigentes(appointments: list[Appointment]) -> list[AppointmentResponse]:
+    """Versión en lote de `_con_telefono_vigente`: un solo `IN` para toda la página."""
+    telefonos = _telefonos_vigentes({a.patient_user_id for a in appointments})
+    return [_con_telefono_vigente(a, telefonos) for a in appointments]
 
 
 def _is_staff_for(apt: Appointment, roles: list[str], user_id: int) -> bool:
@@ -448,7 +473,7 @@ async def get_upcoming_appointments(
         .limit(limit)
         .all()
     )
-    return {"appointments": appointments, "total": len(appointments)}
+    return {"appointments": _con_telefonos_vigentes(appointments), "total": len(appointments)}
 
 
 @router.get("/", response_model=AppointmentListResponse)
@@ -517,7 +542,7 @@ async def list_appointments(
         query.order_by(*_orden_de_la_lista(con_rango=date_from is not None))
         .offset(offset).limit(limit).all()
     )
-    return {"appointments": appointments, "total": total}
+    return {"appointments": _con_telefonos_vigentes(appointments), "total": total}
 
 
 @router.get("/{appointment_id}", response_model=AppointmentResponse)
@@ -536,7 +561,7 @@ async def get_appointment(
     is_own_patient = "PATIENT" in roles and apt.patient_user_id == user_id
     if not _is_staff_for(apt, roles, user_id) and not is_own_patient:
         raise HTTPException(status_code=403, detail="Access denied")
-    return apt
+    return _con_telefono_vigente(apt, _telefonos_vigentes({apt.patient_user_id}))
 
 
 # `get_clinic_id` antes que el guard de rol: sin sesión tiene que salir 401 (el front manda a
@@ -635,7 +660,7 @@ async def create_appointment(
         logger.info(f"Appointment {apt.appointment_id} saved to DB only — dentist has no GCal connected")
 
     db.refresh(apt)
-    return apt
+    return _con_telefono_vigente(apt, _telefonos_vigentes({apt.patient_user_id}))
 
 
 @router.put("/{appointment_id}", response_model=AppointmentResponse,
@@ -792,7 +817,7 @@ async def update_appointment(
         _sync_to_gcal(db, apt, config, patient_email=None, action="update")
 
     db.refresh(apt)
-    return apt
+    return _con_telefono_vigente(apt, _telefonos_vigentes({apt.patient_user_id}))
 
 
 @router.patch("/{appointment_id}/status", response_model=AppointmentResponse)
@@ -870,7 +895,7 @@ async def update_appointment_status(
         _sync_to_gcal(db, apt, config, apt.patient_email, action="create")
 
     db.refresh(apt)
-    return apt
+    return _con_telefono_vigente(apt, _telefonos_vigentes({apt.patient_user_id}))
 
 
 @router.delete("/{appointment_id}", status_code=204)

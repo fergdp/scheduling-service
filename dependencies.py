@@ -2,11 +2,12 @@ import logging
 import base64
 import os
 import threading
-from fastapi import Header, HTTPException, Depends, Cookie
+from fastapi import Header, HTTPException, Depends, Cookie, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
 from jose import jwt, JWTError
-from sqlalchemy import create_engine, text
+from slowapi.util import get_remote_address
+from sqlalchemy import create_engine, text, bindparam
 from sqlalchemy.orm import sessionmaker, Session
 from cachetools import TTLCache
 from contextvars import ContextVar
@@ -84,20 +85,49 @@ def get_db():
     finally:
         db.close()
 
+def _payload_de(token: Optional[str]) -> Optional[dict]:
+    if not token:
+        return None
+    try:
+        return jwt.decode(token, SECRET_KEY_BYTES, algorithms=[ALGORITHM])
+    except JWTError:
+        return None
+
+
 def get_current_user(
     token_cookie: Optional[str] = Cookie(None, alias="token"),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
 ) -> Optional[dict]:
     token = token_cookie or (credentials.credentials if credentials else None)
-    
-    if not token:
-        return None
+    return _payload_de(token)
 
-    try:
-        payload = jwt.decode(token, SECRET_KEY_BYTES, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        return None
+
+def key_por_usuario_o_ip(request: Request) -> str:
+    """
+    Clave del rate limiter (issue #303): por usuario, no por IP.
+
+    `GET /v1/appointments/` estaba limitado por `get_remote_address`, y **toda una clínica sale
+    a internet por el mismo router**: el tope de 60/min era, en los hechos, un tope por clínica
+    entera. Una recepcionista y varios odontólogos mirando la agenda a la vez lo pasaban, y el
+    backend respondía 429 — la agenda se veía vacía con «Error al cargar los turnos».
+
+    Un `Request` crudo no pasa por las dependencias de FastAPI (`get_current_user` recibe la
+    cookie y el header ya resueltos por la inyección de dependencias; el limiter llama a esto
+    ANTES de eso), así que el token se lee a mano, con el mismo criterio: la cookie `token`
+    primero, el header `Authorization: Bearer` después.
+
+    Sin sesión válida —rutas públicas, o un pedido que igual llega sin JWT— cae a la IP: ahí sí
+    hace falta un límite por origen.
+    """
+    token = request.cookies.get("token")
+    if not token:
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:]
+    payload = _payload_de(token)
+    user_id = payload.get("user_id") if payload else None
+    return f"user:{user_id}" if user_id is not None else get_remote_address(request)
+
 
 # Defense-in-depth (#82 H1): cache user_id -> clinic_id de DB con TTL 60s para
 # detectar JWT con clinic_id manipulado sin pegarle a DB en cada request.
@@ -126,6 +156,39 @@ def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
     with _user_clinic_cache_lock:
         _user_clinic_cache[user_id] = db_clinic_id
     return db_clinic_id
+
+
+def telefonos_vigentes_de(patient_user_ids) -> dict:
+    """
+    El teléfono ACTUAL de cada paciente, según `users` de dental-clinic (issue #313).
+
+    El turno guarda `patient_phone` al crearse y nada lo actualiza después: si el paciente
+    cambia de número y lo corrigen en su ficha, los turnos que ya tenía siguen con el viejo, y
+    con eso el recordatorio por WhatsApp (#295) le llega a quien tenga hoy esa línea. Los
+    endpoints de lectura llaman a esto para mostrar el vigente y sólo caer al guardado si el
+    paciente no tiene uno cargado (mejor un número viejo que ninguno).
+
+    Sin caché a propósito: es la misma tabla que `_resolve_db_clinic_id`, pero ahí un TTL de
+    60 s es una demora aceptable para un cross-check de seguridad; acá sería mostrar el número
+    viejo un minuto más, que es exactamente el bug que esto arregla.
+
+    Un `IN` por página, no una consulta por turno: el propio issue medía ese costo antes de
+    decidir este enfoque en vez de escribir el teléfono vigente en cada turno al corregirlo.
+    """
+    ids = {i for i in patient_user_ids if i}
+    if not ids:
+        return {}
+
+    db = ClinicSessionLocal()
+    try:
+        filas = db.execute(
+            text("SELECT user_id, phone FROM users WHERE user_id IN :ids")
+            .bindparams(bindparam("ids", expanding=True)),
+            {"ids": list(ids)},
+        ).all()
+    finally:
+        db.close()
+    return {fila[0]: fila[1] for fila in filas if fila[1]}
 
 
 def _is_admin(payload: dict) -> bool:

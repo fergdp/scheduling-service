@@ -161,7 +161,9 @@ class AppointmentResponse(BaseModel):
     dentist_user_id: int
     patient_user_id: int
     patient_name: Optional[str] = None
-    # Teléfono para que recepción pueda llamar desde la ficha del turno.
+    # Teléfono para llamar o recordar por WhatsApp desde la ficha del turno. Las rutas de
+    # lectura lo reemplazan por el vigente en `users` cuando lo tienen (#313); esto es sólo
+    # el guardado al crear el turno, que queda como respaldo si el paciente no tiene uno hoy.
     patient_phone: Optional[str] = None
     start_time_utc: datetime
     end_time_utc: datetime

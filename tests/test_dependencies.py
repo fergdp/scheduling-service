@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 import dependencies
-from dependencies import get_clinic_id, get_user_id, get_db
+from dependencies import get_clinic_id, get_user_id, get_db, telefonos_vigentes_de
 from fastapi import HTTPException
 
 
@@ -208,3 +208,60 @@ def test_get_db_closes_session_on_success():
             next(gen)
     mock_session.close.assert_called_once()
     mock_session.rollback.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# telefonos_vigentes_de — el teléfono ACTUAL del paciente, issue #313
+# ---------------------------------------------------------------------------
+
+def test_telefonos_vigentes_de_sin_ids_no_consulta_la_base():
+    """Ninguna página vacía ni ningún turno sin paciente dispara un SELECT de más."""
+    fake_session = MagicMock()
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
+        assert telefonos_vigentes_de([]) == {}
+        assert telefonos_vigentes_de([None]) == {}
+    fake_session.execute.assert_not_called()
+
+
+def test_telefonos_vigentes_de_arma_el_mapa_id_a_telefono():
+    fake_session = MagicMock()
+    fake_session.execute.return_value.all.return_value = [(5, "351-1234"), (7, "011-9999")]
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
+        assert telefonos_vigentes_de([5, 7]) == {5: "351-1234", 7: "011-9999"}
+
+
+def test_telefonos_vigentes_de_descarta_telefonos_vacios():
+    """
+    Un paciente sin teléfono cargado hoy no puede pisar el que quedó guardado en el turno:
+    el llamador cae al guardado sólo si la clave no está en el mapa.
+    """
+    fake_session = MagicMock()
+    fake_session.execute.return_value.all.return_value = [(5, None), (7, ""), (9, "351-1234")]
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
+        assert telefonos_vigentes_de([5, 7, 9]) == {9: "351-1234"}
+
+
+def test_telefonos_vigentes_de_usa_la_db_de_la_clinica_no_la_de_scheduling():
+    """Mismo motivo que el cross-check #82 H1: `users` vive en dental-clinic, no acá."""
+    fake_clinic_session = MagicMock()
+    fake_clinic_session.execute.return_value.all.return_value = [(5, "351-1234")]
+    fake_scheduling_session = MagicMock()
+
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_clinic_session), \
+         patch.object(dependencies, "SessionLocal", return_value=fake_scheduling_session):
+        assert telefonos_vigentes_de([5]) == {5: "351-1234"}
+
+    fake_clinic_session.execute.assert_called_once()
+    fake_scheduling_session.execute.assert_not_called()
+    fake_clinic_session.close.assert_called_once()
+
+
+def test_telefonos_vigentes_de_pasa_todos_los_ids_en_un_solo_pedido():
+    """Un `IN` por página (#313), no un SELECT por turno."""
+    fake_session = MagicMock()
+    fake_session.execute.return_value.all.return_value = []
+    with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
+        telefonos_vigentes_de([5, 7, 5, 9])
+    fake_session.execute.assert_called_once()
+    params = fake_session.execute.call_args[0][1]
+    assert sorted(params["ids"]) == [5, 7, 9]
