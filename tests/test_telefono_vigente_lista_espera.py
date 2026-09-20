@@ -135,3 +135,30 @@ def test_sin_candidatos_no_pide_telefonos(receptionist_client, monkeypatch):
     res = receptionist_client.get(f"{W}/slots")
     assert res.json()["slots"] == []
     assert llamadas == [set()]
+
+
+def test_un_mismo_candidato_en_dos_avisos_a_la_vez_pide_su_telefono_una_sola_vez(
+    receptionist_client, monkeypatch,
+):
+    """
+    Quien espera a «cualquier odontólogo» puede ser candidato de dos avisos abiertos al mismo
+    tiempo, uno por odontólogo. `telefonos_vigentes_de` dedupea el `IN` (ver test_dependencies.py);
+    esto prueba que a nivel router el id repetido no dispara una segunda consulta y que el
+    vigente se ve igual en los dos avisos, no sólo en el primero.
+    """
+    _id_anotado(receptionist_client, 6)  # cualquier odontólogo
+    apt1 = _turno(_utc(10), dentist=1, paciente=5)
+    apt2 = _turno(_utc(11), dentist=2, paciente=8)
+    assert _patch(receptionist_client, apt1, "CANCELLED").status_code == 200
+    assert _patch(receptionist_client, apt2, "CANCELLED").status_code == 200
+    llamadas = _con_telefonos(monkeypatch, {6: "351-1111-nueva"})
+
+    res = receptionist_client.get(f"{W}/slots")
+    assert res.status_code == 200
+    huecos = res.json()["slots"]
+    assert len(huecos) == 2
+    for hueco in huecos:
+        [candidato] = hueco["candidates"]
+        assert candidato["patient_phone"] == "351-1111-nueva"
+    assert len(llamadas) == 1
+    assert llamadas[0] == {6}
