@@ -285,6 +285,9 @@ class WaitlistEntryResponse(BaseModel):
     entry_id: int
     patient_user_id: int
     patient_name: Optional[str] = None
+    # Teléfono para Llamar o el recordatorio por WhatsApp. Las rutas de lectura lo reemplazan por
+    # el vigente en `users` cuando lo tienen (#314, mismo mecanismo que AppointmentResponse en
+    # #313); esto es sólo el guardado al anotar, que queda como respaldo si no hay uno hoy.
     patient_phone: Optional[str] = None
     dentist_user_id: Optional[int] = None
     available_from_utc: datetime

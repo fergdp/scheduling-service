@@ -16,7 +16,9 @@ from sqlalchemy import and_, or_, true
 from sqlalchemy.orm import Session
 
 import lista_espera
-from dependencies import get_clinic_id, get_db, get_roles, get_user_id, require_any_role
+from dependencies import (
+    get_clinic_id, get_db, get_roles, get_user_id, require_any_role, telefonos_vigentes_de,
+)
 from models import FreedSlot, FreedSlotCloseReason, WaitlistEntry, WaitlistStatus
 from routers import appointments as rutas_turnos
 from schemas import (
@@ -25,6 +27,10 @@ from schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Mismo motivo que `routers/appointments.py`: el teléfono vigente (#313) sale de `users`, tabla
+# que la base de tests no tiene. Acá cubre el mismo bug en la lista de espera (#314).
+_telefonos_vigentes = telefonos_vigentes_de
 
 # ⚠️ Guard de rol en el ROUTER, no endpoint por endpoint: filtrar por `clinic_id` no alcanza,
 # porque un PACIENTE también trae `clinic_id` en su JWT (#261). La lista tiene nombres y
@@ -45,9 +51,17 @@ _SOLO_SU_LISTA = "Un odontólogo sólo puede anotar pacientes en su propia lista
 _NO_ENCONTRADA = "Waiting list entry not found"
 
 
-def _respuesta(entrada: WaitlistEntry, proximo=None) -> WaitlistEntryResponse:
+def _respuesta(entrada: WaitlistEntry, proximo=None, telefonos: dict | None = None) -> WaitlistEntryResponse:
+    """
+    La entrada como `WaitlistEntryResponse`, con `patient_phone` reemplazado por el vigente si
+    `telefonos` tiene uno (#314). Si no, se deja el guardado al anotar: mejor un número viejo
+    que ninguno — mismo criterio que `_con_telefono_vigente` en `routers/appointments.py`.
+    """
     respuesta = WaitlistEntryResponse.model_validate(entrada, from_attributes=True)
     respuesta.next_appointment = AppointmentBrief.model_validate(proximo) if proximo is not None else None
+    vigente = (telefonos or {}).get(entrada.patient_user_id)
+    if vigente:
+        respuesta.patient_phone = vigente
     return respuesta
 
 
@@ -110,8 +124,9 @@ def list_waitlist(
     """Quienes esperan, en orden de llegada, cada uno con su próximo turno si tiene."""
     entradas = lista_espera.entradas_esperando(db, clinic_id=clinic_id, roles=roles, user_id=user_id)
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=entradas)
+    telefonos = _telefonos_vigentes({e.patient_user_id for e in entradas})
     return {
-        "entries": [_respuesta(e, proximos.get(e.entry_id)) for e in entradas],
+        "entries": [_respuesta(e, proximos.get(e.entry_id), telefonos) for e in entradas],
         "total": len(entradas),
     }
 
@@ -159,7 +174,8 @@ def add_to_waitlist(
                 f"(clinic {clinic_id}) by user {user_id}")
 
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=[entrada])
-    return _respuesta(entrada, proximos.get(entrada.entry_id))
+    telefonos = _telefonos_vigentes({entrada.patient_user_id})
+    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos)
 
 
 @router.get("/slots", response_model=FreedSlotListResponse)
@@ -177,6 +193,10 @@ def list_freed_slots(
     para el contador del botón: la pantalla hace un solo pedido por recarga.
     """
     huecos = lista_espera.huecos_con_candidatos(db, clinic_id=clinic_id, roles=roles, user_id=user_id)
+    # Un solo `IN` para todos los candidatos de TODOS los avisos, no uno por hueco.
+    telefonos = _telefonos_vigentes(
+        entrada.patient_user_id for h in huecos for entrada, _ in h.candidatos
+    )
     return {
         "slots": [
             {
@@ -187,7 +207,7 @@ def list_freed_slots(
                 "reason": h.aviso.reason,
                 "created_at": h.aviso.created_at,
                 "can_dismiss": h.puede_descartar,
-                "candidates": [_respuesta(entrada, proximo) for entrada, proximo in h.candidatos],
+                "candidates": [_respuesta(entrada, proximo, telefonos) for entrada, proximo in h.candidatos],
             }
             for h in huecos
         ],
@@ -281,7 +301,8 @@ def update_waitlist_entry(
     logger.info(f"Waitlist entry {entry_id} updated by user {user_id} (clinic {clinic_id})")
 
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=[entrada])
-    return _respuesta(entrada, proximos.get(entrada.entry_id))
+    telefonos = _telefonos_vigentes({entrada.patient_user_id})
+    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos)
 
 
 @router.delete("/{entry_id}", status_code=204)
