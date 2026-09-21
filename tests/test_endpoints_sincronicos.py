@@ -49,6 +49,10 @@ def test_un_pedido_lento_no_bloquea_uno_rapido(client, monkeypatch):
     con una consulta simulada de 400 ms) no le hace esperar a uno rápido (`/`) que llega
     mientras el lento sigue en curso.
 
+    `client` no se usa para pedir nada —los pedidos van por `httpx.Client()` crudo contra el
+    servidor uvicorn real de abajo—: está sólo por su efecto de lado, dejar `app.dependency_overrides`
+    pisado en el mismo objeto `app` que sirve ese servidor, así las rutas no piden auth real.
+
     ⚠️ **Tiene que ser un servidor uvicorn real, no `TestClient`/`ASGITransport` en el mismo
     proceso.** Medido: contra la app en proceso, con dos corutinas sobre el mismo event loop,
     la rápida se cuela durante los `await` genuinos de los middlewares (CORS, CSRF, rate
