@@ -15,6 +15,7 @@ Lo que fija este archivo:
 4. **Correr el inicio conserva la duración**: no se puede estirar un turno sin pedirlo.
 5. **El lock pesimista existe de verdad** en la base de producción.
 6. **Un evento huérfano en Google no se disfraza de sincronizado.**
+7. **La cota de abajo del chequeo de solapamiento (#309) no excluye un choque real.**
 """
 import pytest
 from datetime import datetime, timedelta, timezone
@@ -250,6 +251,52 @@ def test_en_sqlite_no_se_pide_for_update():
     )
     sql = str(query.statement.compile(dialect=dialecto_mysql.dialect())).upper()
     assert "FOR UPDATE" not in sql
+
+
+# ---------------------------------------------------------------------------
+# 7. La cota de abajo del chequeo de solapamiento (#309): acota el rango sin
+#    cambiar el resultado.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("dialecto", ["mysql", "sqlite"])
+def test_la_cota_de_abajo_pide_exactamente_8_horas_antes(dialecto):
+    """
+    `start_time_utc >= start - 8h` tiene que estar en la consulta para CUALQUIER dialecto —a
+    diferencia del `FOR UPDATE`, esto no es un lock, es un filtro que acota el índice—, y con
+    el valor exacto: un turno dura como mucho 8 horas (`_validate_times`), así que 7h59 dejaría
+    afuera un choque real y 8h01 dejaría de acotar nada.
+    """
+    from sqlalchemy.dialects import mysql as dialecto_mysql
+    from routers.appointments import _armar_query_solapamiento
+
+    inicio = datetime(2030, 6, 15, 14, 0)
+    query = _armar_query_solapamiento(
+        db=None, dentist_user_id=1, clinic_id=1,
+        start=inicio, end=inicio + timedelta(minutes=30),
+        exclude_id=None, dialecto=dialecto,
+    )
+    sql = str(query.statement.compile(
+        dialect=dialecto_mysql.dialect(), compile_kwargs={"literal_binds": True},
+    ))
+    cota_correcta = (inicio - timedelta(hours=8)).isoformat(sep=" ")
+    assert cota_correcta in sql, f"no encontré la cota {cota_correcta!r} en:\n{sql}"
+
+
+def test_la_cota_de_abajo_no_excluye_un_choque_pegado_al_borde(receptionist_client):
+    """
+    Control positivo del #309 contra la base real: un turno que arranca 7h59 antes del nuevo y
+    dura las 8 horas máximas todavía lo pisa por un minuto. Si la cota fuera de 8h exactas mal
+    aplicada (`>` en vez de `>=`) o de menos de 8h, este choque real se dejaría de ver.
+    """
+    nuevo_inicio = _manana(14)
+    viejo_inicio = nuevo_inicio - timedelta(hours=7, minutes=59)
+    viejo = _crear(receptionist_client, viejo_inicio, viejo_inicio + timedelta(hours=8))
+    assert viejo.status_code == 200, viejo.json()
+
+    nuevo = _crear(receptionist_client, nuevo_inicio, nuevo_inicio + timedelta(minutes=30))
+    assert nuevo.status_code == 409, (
+        f"la cota de abajo tapó un choque real: {nuevo.status_code} {nuevo.json()}"
+    )
 
 
 # ---------------------------------------------------------------------------

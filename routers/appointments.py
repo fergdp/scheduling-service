@@ -198,7 +198,7 @@ def _validate_times(start: datetime, end: datetime) -> None:
     duration = (e - s).total_seconds()
     if duration < 900:
         raise HTTPException(status_code=422, detail="Appointment duration must be at least 15 minutes")
-    if duration > 28800:
+    if duration > lista_espera.DURACION_MAXIMA_TURNO.total_seconds():
         raise HTTPException(status_code=422, detail="Appointment duration cannot exceed 8 hours")
 
 
@@ -226,6 +226,12 @@ def _armar_query_solapamiento(db, dentist_user_id: int, clinic_id: int,
         Appointment.clinic_id == clinic_id,
         Appointment.status.in_(list(ACTIVE_STATUSES)),
         Appointment.deleted_at.is_(None),
+        # Un turno dura como mucho DURACION_MAXIMA_TURNO (`_validate_times`), así que uno que
+        # empieza antes de esa cota no puede llegar a pisar `start`: no cambia el resultado,
+        # sólo acota el rango que el índice —y el FOR UPDATE de más abajo— tiene que recorrer
+        # (#309). Con años de agenda, sin esto cada alta escaneaba y lockeaba toda la historia
+        # del odontólogo. Mismo criterio que `lista_espera._agenda_alrededor_del_hueco`.
+        Appointment.start_time_utc >= start - lista_espera.DURACION_MAXIMA_TURNO,
         # Pegados no se pisan: uno que termina 15:00 y otro que empieza 15:00 conviven.
         Appointment.start_time_utc < end,
         Appointment.end_time_utc > start,
@@ -379,12 +385,21 @@ def _add_audit(db: Session, apt: Appointment, user_id: int,
 
 # ---------------------------------------------------------------------------
 # Endpoints
+#
+# `def`, no `async def` (#306): SQLAlchemy acá es sincrónico (`Session`, no `AsyncSession`) y
+# también lo son las llamadas a Google Calendar (`utils/google_calendar.py`, sobre
+# `google-api-python-client`, bloqueante). Un `await` real no existe en ninguno de estos
+# endpoints — se verificó grepeando `await` en este archivo antes de tocar nada—, así que un
+# `async def` acá no ganaba concurrencia: sólo bloqueaba el event loop del worker ENTERO
+# mientras corría, incluido el tiempo de red hablando con Google. Con `def`, FastAPI los corre
+# en su pool de hilos y el event loop queda libre para atender otros pedidos, de otras
+# clínicas. Mismo criterio que ya tenían los endpoints de la lista de espera (`routers/waitlist.py`).
 # ---------------------------------------------------------------------------
 
 @router.get("/availability/dentist/{dentist_id}",
             dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("30/minute")
-async def get_dentist_availability(
+def get_dentist_availability(
     request: Request,
     dentist_id: int,
     start: datetime,
@@ -442,7 +457,7 @@ async def get_dentist_availability(
 
 @router.get("/upcoming", response_model=AppointmentListResponse)
 @limiter.limit("60/minute")
-async def get_upcoming_appointments(
+def get_upcoming_appointments(
     request: Request,
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
@@ -478,7 +493,7 @@ async def get_upcoming_appointments(
 
 @router.get("/", response_model=AppointmentListResponse)
 @limiter.limit("60/minute")
-async def list_appointments(
+def list_appointments(
     request: Request,
     db: Session = Depends(get_db),
     clinic_id: int = Depends(get_clinic_id),
@@ -547,7 +562,7 @@ async def list_appointments(
 
 @router.get("/{appointment_id}", response_model=AppointmentResponse)
 @limiter.limit("60/minute")
-async def get_appointment(
+def get_appointment(
     request: Request,
     appointment_id: int,
     db: Session = Depends(get_db),
@@ -569,7 +584,7 @@ async def get_appointment(
 @router.post("/", response_model=AppointmentResponse,
              dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("20/minute")
-async def create_appointment(
+def create_appointment(
     request: Request,
     apt_data: AppointmentCreate,
     db: Session = Depends(get_db),
@@ -666,7 +681,7 @@ async def create_appointment(
 @router.put("/{appointment_id}", response_model=AppointmentResponse,
             dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
 @limiter.limit("20/minute")
-async def update_appointment(
+def update_appointment(
     request: Request,
     appointment_id: int,
     update_data: AppointmentUpdate,
@@ -822,7 +837,7 @@ async def update_appointment(
 
 @router.patch("/{appointment_id}/status", response_model=AppointmentResponse)
 @limiter.limit("20/minute")
-async def update_appointment_status(
+def update_appointment_status(
     request: Request,
     appointment_id: int,
     status_update: AppointmentStatusUpdate,
@@ -900,7 +915,7 @@ async def update_appointment_status(
 
 @router.delete("/{appointment_id}", status_code=204)
 @limiter.limit("20/minute")
-async def delete_appointment(
+def delete_appointment(
     request: Request,
     appointment_id: int,
     db: Session = Depends(get_db),

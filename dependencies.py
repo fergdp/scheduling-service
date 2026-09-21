@@ -44,8 +44,16 @@ current_clinic_id: ContextVar[Optional[int]] = ContextVar("current_clinic_id", d
 
 # Pool sizing — issue #33.
 # `engine` recibe todo el tráfico de appointments → pool grande.
-# `clinic_engine` solo hace el SELECT del cross-check #82 H1 (cacheado TTL 60s)
-# → pool default-ish alcanza, no necesita 20.
+#
+# `clinic_engine` (#315): YA NO es sólo el SELECT cacheado del cross-check #82 H1 (TTL 60s).
+# Desde el #313 y el #314, `telefonos_vigentes_de` usa el MISMO engine sin caché a propósito
+# (acá la frescura importa más que el costo de un SELECT de más) desde 10 endpoints de lectura
+# entre `routers/appointments.py` y `routers/waitlist.py`. `pool_size=5, max_overflow=10` (15
+# conexiones) sigue siendo razonable para la escala actual —consultas puntuales por `user_id`,
+# clínicas chicas—, pero es una estimación, no una medición: no hay forma de probar el
+# agotamiento real del pool contra SQLite (`_make_engine` le ignora `pool_size`/`max_overflow`
+# a propósito, ver abajo). Si el tráfico concurrente crece, medir con un load test contra
+# MySQL/MariaDB antes de tocar el número.
 def _make_engine(url: str, pool_size: int, max_overflow: int):
     # SQLite usa SingletonThreadPool y no acepta pool_size/max_overflow/pool_timeout.
     # En tests (sqlite://) caemos a defaults; en prod (mysql+pymysql) aplican los pool kwargs.

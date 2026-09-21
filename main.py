@@ -173,7 +173,10 @@ async def log_requests(request: Request, call_next):
     if token:
         try:
             payload = jwt.decode(token, SECRET_KEY_BYTES, algorithms=[ALGORITHM])
-            user_id = payload.get("sub", "unknown")
+            # user_id numérico, no `sub` (el nombre de usuario, que en pacientes puede
+            # coincidir con el mail): alcanza igual para correlacionar en Grafana/Loki, sin
+            # identificar a la persona en el log (#307, misma fuga que el #137 en dental-clinic).
+            user_id = payload.get("user_id", "unknown")
             clinic_id = payload.get("clinic_id", "N/A")
         except JWTError as e:
             logging.warning(f"Middleware JWT processing error: {e}")
@@ -202,7 +205,8 @@ async def exception_handler(request: Request, exc: Exception):
     if token:
         try:
             payload = jwt.decode(token, SECRET_KEY_BYTES, algorithms=[ALGORITHM])
-            user_id = payload.get("sub", "unknown")
+            # Mismo criterio que log_requests: user_id numérico, no `sub` (#307).
+            user_id = payload.get("user_id", "unknown")
             clinic_id = payload.get("clinic_id", "N/A")
         except JWTError:
             user_id = "invalid_token"

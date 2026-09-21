@@ -63,8 +63,13 @@ def _decode_state_jwt(state: str) -> dict:
         raise HTTPException(status_code=400, detail="Invalid OAuth state — possible CSRF attack")
 
 
+# `def`, no `async def` en los 4 endpoints de este archivo (#306): tanto la consulta
+# SQLAlchemy sincrónica como `exchange_code_for_tokens`/`get_google_user_email` (llamadas HTTP
+# bloqueantes a Google) son trabajo síncrono — no hay ningún `await` real acá, verificado
+# grepeando el archivo—, así que declararlos `async def` sólo bloqueaba el event loop del
+# worker entero mientras esperaban la respuesta de Google, sin ganar nada a cambio.
 @router.get("/status", dependencies=[require_any_role("DENTIST", "ADMIN")])
-async def get_gcal_status(
+def get_gcal_status(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
@@ -82,7 +87,7 @@ async def get_gcal_status(
 
 
 @router.delete("/disconnect", dependencies=[require_any_role("DENTIST", "ADMIN")])
-async def disconnect_gcal(
+def disconnect_gcal(
     db: Session = Depends(get_db),
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
@@ -103,7 +108,7 @@ async def disconnect_gcal(
 
 
 @router.get("/url", response_model=OAuthUrlResponse, dependencies=[require_any_role("DENTIST", "ADMIN")])
-async def get_auth_url(
+def get_auth_url(
     response: Response,
     user_id: int = Depends(get_user_id),
     clinic_id: int = Depends(get_clinic_id)
@@ -140,7 +145,7 @@ async def get_auth_url(
 # Callback es PÚBLICO — el redirect de Google es top-level y no envía la cookie
 # de sesión httpOnly. La identidad del dentista viene del state JWT firmado.
 @router.get("/callback")
-async def oauth_callback(
+def oauth_callback(
     response: Response,
     code: str = Query(...),
     state: str = Query(...),
