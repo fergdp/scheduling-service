@@ -511,6 +511,12 @@ def list_appointments(
     dentist_user_id: Optional[int] = Query(None),
     date_from: Optional[datetime] = Query(None),
     date_to: Optional[datetime] = Query(None),
+    # Búsqueda del mostrador (#299): "soy Juan Pérez, ¿cuándo tengo turno?". Contra el
+    # `patient_name` de la propia fila (snapshot al crear el turno, igual que el resto de
+    # los `patient_*`) — no contra el nombre vigente en dental-clinic. Server-side a
+    # propósito: la lista trae como mucho 200 turnos por pedido, y filtrar sólo esos en el
+    # cliente dejaría afuera un turno más viejo que si esté en la clínica.
+    patient_name: Optional[str] = Query(None, max_length=255),
 ):
     """
     Lista turnos de la clínica con filtros opcionales.
@@ -520,6 +526,9 @@ def list_appointments(
 
     `status`: uno o varios estados (#302). «Por atender» son tres: programado, confirmado y en
     espera.
+
+    `patient_name`: substring, sin distinguir mayúsculas. Contra el snapshot guardado en el
+    turno, no contra dental-clinic — un patient_name vacío o `None` no filtra nada.
 
     `patient_user_id`: la solapa Turnos de la historia clínica. Acá el alcance por profesional
     **no se aplica a propósito**: el odontólogo que abre la ficha de un paciente necesita su
@@ -550,6 +559,8 @@ def list_appointments(
         filters.append(Appointment.start_time_utc < _naive(date_to))
     if status:
         filters.append(Appointment.status.in_(status))
+    if patient_name and patient_name.strip():
+        filters.append(Appointment.patient_name.ilike(f"%{patient_name.strip()}%"))
 
     query = _visibles(db.query(Appointment).filter(and_(*filters)))
     total = query.count()

@@ -13,7 +13,8 @@ def future_slot(days_ahead=1, duration_minutes=30):
     return start.isoformat(), end.isoformat()
 
 
-def create_appointment(client, dentist_user_id=1, patient_user_id=5, days_ahead=1, reason="Test"):
+def create_appointment(client, dentist_user_id=1, patient_user_id=5, days_ahead=1, reason="Test",
+                        patient_name="Test Patient"):
     """Crea un turno via API. El client debe tener rol ADMIN o RECEPTIONIST."""
     start, end = future_slot(days_ahead)
     res = client.post(
@@ -21,7 +22,7 @@ def create_appointment(client, dentist_user_id=1, patient_user_id=5, days_ahead=
         json={
             "dentist_user_id": dentist_user_id,
             "patient_user_id": patient_user_id,
-            "patient_name": "Test Patient",
+            "patient_name": patient_name,
             "start_time_utc": start,
             "end_time_utc": end,
             "reason": reason,
@@ -32,16 +33,17 @@ def create_appointment(client, dentist_user_id=1, patient_user_id=5, days_ahead=
 
 
 def insert_appointment_db(dentist_user_id=1, patient_user_id=5, days_ahead=1,
-                           status=AppointmentStatus.SCHEDULED):
+                           status=AppointmentStatus.SCHEDULED, clinic_id=1, patient_name=None):
     """Inserta un turno directo en DB, sin pasar por la API ni dependency_overrides."""
     from conftest import TestingSessionLocal
     db = TestingSessionLocal()
     start = datetime.now() + timedelta(days=days_ahead)
     end = start + timedelta(minutes=30)
     apt = Appointment(
-        clinic_id=1,
+        clinic_id=clinic_id,
         patient_user_id=patient_user_id,
         dentist_user_id=dentist_user_id,
+        patient_name=patient_name,
         start_time_utc=start,
         end_time_utc=end,
         status=status,
@@ -215,6 +217,78 @@ def test_list_appointments_filter_by_status(client):
     res = client.get("/clinic-scheduling-api/v1/appointments/?status=CANCELLED")
     assert res.status_code == 200
     assert res.json()["total"] == 1
+
+
+def test_list_appointments_filter_by_patient_name_substring(client):
+    """#299: buscar por un pedazo del nombre encuentra el turno, sin traer los demás."""
+    create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    create_appointment(client, dentist_user_id=1, days_ahead=5, patient_name="Rosa Díaz")
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=P%C3%A9rez")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["total"] == 1
+    assert body["appointments"][0]["patient_name"] == "Juan Pérez"
+
+
+def test_list_appointments_filter_by_patient_name_case_insensitive(client):
+    """No importan mayúsculas: quien llama dice 'perez', no 'Pérez'."""
+    create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=JUAN")
+    assert res.status_code == 200
+    assert res.json()["total"] == 1
+
+
+def test_list_appointments_filter_by_patient_name_no_match_is_empty_not_error(client):
+    """Un nombre que no está no rompe nada: lista vacía, 200."""
+    create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=Nadie")
+    assert res.status_code == 200
+    assert res.json()["total"] == 0
+
+
+def test_list_appointments_filter_by_patient_name_combines_with_status(client):
+    """Se combina con el filtro de estado (#302), no lo reemplaza."""
+    apt_id = create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    create_appointment(client, dentist_user_id=1, days_ahead=5, patient_name="Juan Gómez")
+    client.patch(f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
+                 json={"status": "CANCELLED"})
+    # "Juan" solo trae 2; agregar el estado lo deja en 1 — no en 0 ni en los 2.
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=Juan&status=CANCELLED")
+    assert res.status_code == 200
+    assert res.json()["total"] == 1
+
+
+def test_list_appointments_filter_by_patient_name_blank_behaves_as_no_filter(client):
+    """Un patient_name vacío no filtra nada — no es un 'no encontrado', es 'sin filtro'."""
+    create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=")
+    assert res.status_code == 200
+    assert res.json()["total"] == 1
+
+
+def test_list_appointments_filter_by_patient_name_ignores_row_without_name(client):
+    """Un turno insertado sin patient_name (NULL) no rompe el ILIKE de otra búsqueda."""
+    insert_appointment_db(dentist_user_id=1, days_ahead=6)  # patient_name=None
+    create_appointment(client, dentist_user_id=1, days_ahead=4, patient_name="Juan Pérez")
+    res = client.get("/clinic-scheduling-api/v1/appointments/?patient_name=Juan")
+    assert res.status_code == 200
+    assert res.json()["total"] == 1
+
+
+def test_list_appointments_filter_by_patient_name_scoped_to_clinic(other_clinic_client):
+    """Un nombre coincidente en OTRA clínica no aparece — el scope de clinic_id no se salta.
+
+    ⚠️ No usa `client` y `other_clinic_client` juntos: los dos pisan el mismo
+    `app.dependency_overrides` global, y el que se resuelve último (por orden de
+    parámetros) gana para los dos — crear el turno con `client` mientras
+    `other_clinic_client` ya está armado termina pegándole a la clínica 2 y sale
+    422 "Dentist not found in this clinic". El turno de la clínica 1 se inserta
+    directo en la base, sin pasar por ningún cliente HTTP.
+    """
+    insert_appointment_db(dentist_user_id=1, days_ahead=4, clinic_id=1, patient_name="Juan Pérez")
+    res = other_clinic_client.get("/clinic-scheduling-api/v1/appointments/?patient_name=Juan")
+    assert res.status_code == 200
+    assert res.json()["total"] == 0
 
 
 def test_list_appointments_patient_sees_own(patient_client):
