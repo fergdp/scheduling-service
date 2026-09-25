@@ -630,6 +630,76 @@ def test_update_appointment_out_of_schedule_is_rejected(client):
     assert "horario" in res.json()["detail"].lower()
 
 
+def test_edit_without_moving_an_appointment_outside_the_schedule_is_allowed(client):
+    """
+    Un turno dado ANTES de que el odontólogo cargara su horario queda afuera de él y sigue
+    existiendo tal cual (sin efecto retroactivo). Editarle el motivo tiene que andar: el formulario
+    manda SIEMPRE las horas —las mismas— y eso no es moverlo. Sólo mover se valida.
+    """
+    start = _futuro(1, 15, 0)
+    end = start + timedelta(minutes=30)
+    apt_id = _crear_turno(client, 1, start, end).json()["appointment_id"]   # sin horario: entra
+    _cargar_horario(client, 1, [(start.weekday(), "09:00", "13:00")])       # ahora 15:00 queda afuera
+
+    res = client.put(
+        f"/clinic-scheduling-api/v1/appointments/{apt_id}",
+        json={"start_time_utc": start.isoformat(), "end_time_utc": end.isoformat(), "reason": "Control"},
+    )
+    assert res.status_code == 200, res.json()
+    assert res.json()["reason"] == "Control"
+
+
+def test_moving_an_appointment_to_another_dentist_checks_his_schedule(client):
+    """Pasarlo a otro odontólogo SÍ es moverlo: ese odontólogo tiene que atender a esa hora."""
+    start = _futuro(1, 10, 0)
+    apt_id = _crear_turno(client, 1, start, start + timedelta(minutes=30)).json()["appointment_id"]
+    _cargar_horario(client, 99, [(start.weekday(), "15:00", "19:00")])   # el 99 sólo atiende a la tarde
+
+    res = client.put(f"/clinic-scheduling-api/v1/appointments/{apt_id}", json={"dentist_user_id": 99})
+    assert res.status_code == 409
+    assert "horario" in res.json()["detail"].lower()
+
+    _cargar_horario(client, 99, [(start.weekday(), "09:00", "13:00")])   # ahora sí atiende a esa hora
+    res = client.put(f"/clinic-scheduling-api/v1/appointments/{apt_id}", json={"dentist_user_id": 99})
+    assert res.status_code == 200, res.json()
+
+
+@pytest.mark.parametrize("estado", [AppointmentStatus.COMPLETED, AppointmentStatus.NO_SHOW])
+def test_undoing_attended_or_no_show_outside_the_schedule_is_allowed(client, estado):
+    """
+    Corregir un «atendido» o un «ausente» no es dar un turno: el turno ya estaba dado en ese
+    horario. Si el Deshacer fallara por el horario nuevo, un turno anterior a él quedaría sin poder
+    corregirse —ni dándolo de nuevo, porque eso también se rechaza—.
+    """
+    start = _futuro(2, 15, 0)
+    apt_id = _insertar_turno_db(1, start, start + timedelta(minutes=30), status=estado)
+    _cargar_horario(client, 1, [(start.weekday(), "09:00", "13:00")])
+
+    res = client.patch(
+        f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
+        json={"status": "SCHEDULED"},
+    )
+    assert res.status_code == 200, res.json()
+
+
+def test_undoing_attended_into_a_block_is_still_rejected(client):
+    """El bloqueo sí se respeta: un turno activo no puede convivir con él."""
+    start, end = _futuro(2, 9), _futuro(2, 10)
+    apt_id = _insertar_turno_db(1, start, end, status=AppointmentStatus.COMPLETED)
+    creado = client.post(   # un turno atendido no ocupa el hueco: el bloqueo se puede crear
+        "/clinic-scheduling-api/v1/dentists/1/blocks",
+        json={"start_time_utc": start.isoformat(), "end_time_utc": end.isoformat(), "reason": "x"},
+    )
+    assert creado.status_code == 200, creado.json()
+
+    res = client.patch(
+        f"/clinic-scheduling-api/v1/appointments/{apt_id}/status",
+        json={"status": "SCHEDULED"},
+    )
+    assert res.status_code == 409
+    assert "bloqueado" in res.json()["detail"].lower()
+
+
 def test_reactivating_appointment_out_of_schedule_is_rejected(client):
     """Un CANCELLED que quedó fuera del horario (el odontólogo lo cambió después) no se reactiva
     sin re-chequear: vuelve a ocupar el hueco, así que vale lo mismo que al crear."""

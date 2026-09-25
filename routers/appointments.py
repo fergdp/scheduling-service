@@ -868,6 +868,12 @@ def update_appointment(
 
     if times_changed or dentist_changed:
         _check_overlap(db, new_dentist, clinic_id, new_start, new_end, exclude_id=appointment_id)
+    # Horario de atención y bloqueos (#296): sólo si el turno SE MUEVE de verdad. El formulario de
+    # editar manda SIEMPRE las horas —aunque sólo se haya tocado el motivo—, así que atarlo a
+    # `times_changed` (que mira si el campo vino, no si cambió) rechazaba con «Fuera del horario»
+    # cualquier edición de un turno dado antes de que el odontólogo cargara su horario. El diseño
+    # dice sin efecto retroactivo: la fricción aparece recién al intentar cambiarlo de lugar.
+    if movido:
         _check_dentro_de_horario(db, new_dentist, clinic_id, new_start, new_end)
         _check_sin_bloqueo(db, new_dentist, clinic_id, new_start, new_end)
 
@@ -960,9 +966,11 @@ def update_appointment_status(
     - Staff (ADMIN, RECEPTIONIST, odontólogo asignado): a cualquier estado distinto del
       actual. No hay estados terminales: un atendido o un cancelado vuelve a programado.
     - PATIENT: sólo a CANCELLED, y sólo desde SCHEDULED o CONFIRMED.
-    - Volver a un estado activo desde uno inactivo re-chequea solapamiento, horario de
-      atención y bloqueos (409): el hueco pudo ocuparse, o el odontólogo dejar de atender ahí,
-      mientras el turno estaba cancelado (#296).
+    - Volver a un estado activo desde uno inactivo re-chequea solapamiento y bloqueos (409): el
+      hueco pudo ocuparse, o bloquearse, mientras el turno estaba inactivo (#296). Si venía de
+      CANCELADO también re-chequea el horario de atención: se vuelve a ocupar un hueco que se
+      había liberado. Atendido y ausente NO: corregir un estado no es dar un turno, y un turno dado
+      antes de que existiera el horario (sin efecto retroactivo) quedaría sin poder deshacerse.
     Google Calendar: CANCELLED borra el evento; volver a activo lo recrea si no existe;
     COMPLETED y NO_SHOW no lo tocan.
     """
@@ -989,8 +997,9 @@ def update_appointment_status(
     if new_status in ACTIVE_STATUSES and previous not in ACTIVE_STATUSES:
         _check_overlap(db, apt.dentist_user_id, clinic_id,
                        apt.start_time_utc, apt.end_time_utc, exclude_id=appointment_id)
-        _check_dentro_de_horario(db, apt.dentist_user_id, clinic_id,
-                                 apt.start_time_utc, apt.end_time_utc)
+        if previous == AppointmentStatus.CANCELLED:
+            _check_dentro_de_horario(db, apt.dentist_user_id, clinic_id,
+                                     apt.start_time_utc, apt.end_time_utc)
         _check_sin_bloqueo(db, apt.dentist_user_id, clinic_id,
                            apt.start_time_utc, apt.end_time_utc)
 
