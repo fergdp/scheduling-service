@@ -165,6 +165,8 @@ def create_block(
                 "conflicting_appointments": [
                     {
                         "appointment_id": t.appointment_id,
+                        # Puede ser None: el turno guarda un snapshot y no siempre trae nombre.
+                        "patient_name": t.patient_name,
                         "start_time_utc": t.start_time_utc.isoformat(),
                         "end_time_utc": t.end_time_utc.isoformat(),
                     }

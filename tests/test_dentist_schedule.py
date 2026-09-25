@@ -55,13 +55,13 @@ def _crear_turno(client, dentist_user_id, start: datetime, end: datetime, patien
 
 
 def _insertar_turno_db(dentist_user_id, start, end, status=AppointmentStatus.SCHEDULED, clinic_id=1,
-                       deleted_at=None):
+                       deleted_at=None, patient_name=None):
     from conftest import TestingSessionLocal
     db = TestingSessionLocal()
     apt = Appointment(
         clinic_id=clinic_id, dentist_user_id=dentist_user_id, patient_user_id=5,
         start_time_utc=_naive_utc(start), end_time_utc=_naive_utc(end), status=status,
-        deleted_at=deleted_at,
+        deleted_at=deleted_at, patient_name=patient_name,
     )
     db.add(apt)
     db.commit()
@@ -293,17 +293,25 @@ def test_block_rejects_whitespace_only_reason(client):
 
 
 def test_block_over_active_appointment_is_rejected(client):
-    """Decisión 2: un bloqueo que pisa un turno ACTIVO se rechaza, con la lista de turnos."""
+    """
+    Decisión 2: un bloqueo que pisa un turno ACTIVO se rechaza, con la lista de turnos — y de cada
+    uno, el nombre del paciente: sin él la lista son sólo fechas y horas, y quien bloquea no sabe
+    a quién tiene que llamar para reprogramar. Un turno sin nombre guardado trae `null`, no falta.
+    """
     start, end = _futuro(2, 9), _futuro(2, 10)
-    apt_id = _insertar_turno_db(1, start, end, status=AppointmentStatus.SCHEDULED)
+    con_nombre = _insertar_turno_db(1, start, end, patient_name="Ana García")
+    sin_nombre = _insertar_turno_db(1, start + timedelta(minutes=30), end)
 
     res = client.post(
         "/clinic-scheduling-api/v1/dentists/1/blocks",
         json={"start_time_utc": start.isoformat(), "end_time_utc": end.isoformat(), "reason": "Vacaciones"},
     )
     assert res.status_code == 409
-    ids_pisados = [t["appointment_id"] for t in res.json()["detail"]["conflicting_appointments"]]
-    assert apt_id in ids_pisados
+    pisados = {
+        t["appointment_id"]: t["patient_name"]
+        for t in res.json()["detail"]["conflicting_appointments"]
+    }
+    assert pisados == {con_nombre: "Ana García", sin_nombre: None}
 
 
 def test_block_over_cancelled_appointment_is_allowed(client):
