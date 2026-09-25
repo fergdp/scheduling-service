@@ -27,3 +27,8 @@ python-logging-loki==0.3.1
 # Observabilidad (issue #75): métricas RED en /metrics para Prometheus.
 prometheus-fastapi-instrumentator==8.0.0
 cachetools==5.5.0
+# `zoneinfo` (stdlib) necesita esto en Windows: a diferencia de Linux/macOS, Windows no trae la
+# base IANA del sistema, y sin tzdata instalado ZoneInfo("America/Argentina/Buenos_Aires")
+# revienta con ZoneInfoNotFoundError. El horario de atención por odontólogo (#296) es la primera
+# vez que este servicio necesita saber en qué huso está la clínica, no sólo comparar instantes.
+tzdata==2026.4

@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
@@ -13,6 +14,7 @@ import lista_espera
 from models import (
     Appointment, DentistCalendarConfig, AppointmentStatus, ACTIVE_STATUSES,
     AppointmentAuditLog, FreedSlotReason, GcalSyncStatus,
+    DentistScheduleSlot, DentistScheduleBlock,
 )
 from schemas import (
     AppointmentCreate, AppointmentUpdate, AppointmentResponse,
@@ -32,6 +34,13 @@ router = APIRouter()
 limiter = Limiter(key_func=key_por_usuario_o_ip)
 
 _DEFAULT_DURATION_MINUTES = 30
+
+# El horario semanal (#296) se carga y se piensa en hora LOCAL de la clínica — un solo huso
+# para todo el sistema, mismo supuesto implícito que ya usa el resto (front incluido: el
+# browser muestra todo en su huso local sin que el backend necesite saberlo). Acá SÍ hace
+# falta saberlo: es la primera vez que este servicio compara "qué día/hora de la semana es"
+# en vez de sólo comparar instantes UTC entre sí.
+_HUSO_CLINICA = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # Estados desde los que un PACIENTE puede cancelar por el portal. Una vez que llegó a la
 # sala de espera (ARRIVED) o el turno ya cerró, cancelar es cosa del staff.
@@ -270,6 +279,91 @@ def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
             status_code=409,
             detail="This time slot is already booked for the selected dentist"
         )
+
+
+def _check_dentro_de_horario(db: Session, dentist_user_id: int, clinic_id: int,
+                             start: datetime, end: datetime) -> None:
+    """
+    Si el odontólogo tiene AL MENOS UNA fila en `dentist_schedule_slots`, el turno tiene que
+    caer entero dentro de UNA sola fila de ese día de la semana (#296) — así un turno que pisa
+    el corte del mediodía entre dos franjas se rechaza, no alcanza con que el inicio esté en
+    una franja y el fin en otra. Sin ninguna fila cargada, sigue disponible siempre: la
+    restricción es opt-in por odontólogo, no rompe a nadie que no configuró nada (decisión 4
+    del diseño).
+
+    ⚠️ `start`/`end` llegan en UTC; `DentistScheduleSlot.weekday`/`start_time`/`end_time` están
+    en hora LOCAL de la clínica (`_HUSO_CLINICA`). Hay que convertir ANTES de mirar día/hora —
+    comparar el UTC crudo contra una franja local rechaza turnos adentro del horario real y
+    acepta turnos fuera de él, corrido por el offset (encontrado por review, no en la primera
+    versión: los tests armaban horario y turno con el mismo reloj por construcción y el huso
+    nunca se ejercitaba).
+    """
+    start, end = _naive(start), _naive(end)
+    tiene_horario = db.query(DentistScheduleSlot.slot_id).filter(
+        DentistScheduleSlot.dentist_user_id == dentist_user_id,
+        DentistScheduleSlot.clinic_id == clinic_id,
+    ).first() is not None
+    if not tiene_horario:
+        return
+
+    inicio_local = start.replace(tzinfo=timezone.utc).astimezone(_HUSO_CLINICA)
+    fin_local = end.replace(tzinfo=timezone.utc).astimezone(_HUSO_CLINICA)
+
+    cabe_en_alguna_franja = db.query(DentistScheduleSlot.slot_id).filter(
+        DentistScheduleSlot.dentist_user_id == dentist_user_id,
+        DentistScheduleSlot.clinic_id == clinic_id,
+        DentistScheduleSlot.weekday == inicio_local.weekday(),
+        DentistScheduleSlot.start_time <= inicio_local.time(),
+        DentistScheduleSlot.end_time >= fin_local.time(),
+    ).first() is not None
+    if not cabe_en_alguna_franja:
+        raise HTTPException(status_code=409, detail="Fuera del horario de atención del odontólogo")
+
+
+def _check_sin_bloqueo(db: Session, dentist_user_id: int, clinic_id: int,
+                       start: datetime, end: datetime) -> None:
+    """El turno no puede pisar un bloqueo de agenda del odontólogo — vacaciones, congreso,
+    etc. (#296). Mismo predicado de solapamiento que `_armar_query_solapamiento`: pegados no
+    se pisan."""
+    start, end = _naive(start), _naive(end)
+    bloqueo = db.query(DentistScheduleBlock).filter(
+        DentistScheduleBlock.dentist_user_id == dentist_user_id,
+        DentistScheduleBlock.clinic_id == clinic_id,
+        DentistScheduleBlock.start_time_utc < end,
+        DentistScheduleBlock.end_time_utc > start,
+    ).first()
+    if bloqueo:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Ese horario está bloqueado: {bloqueo.reason}",
+        )
+
+
+def _turnos_activos_en_rango(db: Session, dentist_user_id: int, clinic_id: int,
+                             start: datetime, end: datetime) -> list[Appointment]:
+    """
+    Turnos ACTIVOS que pisarían este rango — usado al crear un bloqueo (#296): si hay alguno,
+    el bloqueo se rechaza (409) con esta lista, para que quien lo carga sepa qué reprogramar o
+    cancelar antes de poder bloquear la franja. Nada se mueve ni se cancela solo.
+
+    `FOR UPDATE` en MySQL/MariaDB, mismo motivo y mismo límite que `_armar_query_solapamiento`:
+    protege contra crear un turno mientras esta consulta está en vuelo (el turno existente
+    queda lockeado hasta que una de las dos transacciones commitee), no contra dos turnos
+    nuevos entrando a la vez en un hueco vacío — eso ya es una limitación aceptada de
+    `_check_overlap`, no una nueva.
+    """
+    start, end = _naive(start), _naive(end)
+    query = db.query(Appointment).filter(
+        Appointment.dentist_user_id == dentist_user_id,
+        Appointment.clinic_id == clinic_id,
+        Appointment.status.in_(list(ACTIVE_STATUSES)),
+        Appointment.deleted_at.is_(None),
+        Appointment.start_time_utc < end,
+        Appointment.end_time_utc > start,
+    ).order_by(Appointment.start_time_utc)
+    if _dialecto(db) in DIALECTOS_CON_LOCK:
+        query = query.with_for_update()
+    return query.all()
 
 
 def _gcal_description(apt: Appointment) -> tuple[str, str]:
@@ -647,6 +741,8 @@ def create_appointment(
         )
 
     _check_overlap(db, apt_data.dentist_user_id, clinic_id, start, end)
+    _check_dentro_de_horario(db, apt_data.dentist_user_id, clinic_id, start, end)
+    _check_sin_bloqueo(db, apt_data.dentist_user_id, clinic_id, start, end)
 
     apt = Appointment(
         clinic_id=clinic_id,
@@ -772,6 +868,8 @@ def update_appointment(
 
     if times_changed or dentist_changed:
         _check_overlap(db, new_dentist, clinic_id, new_start, new_end, exclude_id=appointment_id)
+        _check_dentro_de_horario(db, new_dentist, clinic_id, new_start, new_end)
+        _check_sin_bloqueo(db, new_dentist, clinic_id, new_start, new_end)
 
     # Todo el cambio de estado local va en UN commit, con el lock del solapamiento vivo.
     # Google se toca recién después: un commit intermedio soltaría el lock antes de
@@ -862,8 +960,9 @@ def update_appointment_status(
     - Staff (ADMIN, RECEPTIONIST, odontólogo asignado): a cualquier estado distinto del
       actual. No hay estados terminales: un atendido o un cancelado vuelve a programado.
     - PATIENT: sólo a CANCELLED, y sólo desde SCHEDULED o CONFIRMED.
-    - Volver a un estado activo desde uno inactivo re-chequea solapamiento (409): el hueco
-      pudo ocuparse mientras el turno estaba cancelado.
+    - Volver a un estado activo desde uno inactivo re-chequea solapamiento, horario de
+      atención y bloqueos (409): el hueco pudo ocuparse, o el odontólogo dejar de atender ahí,
+      mientras el turno estaba cancelado (#296).
     Google Calendar: CANCELLED borra el evento; volver a activo lo recrea si no existe;
     COMPLETED y NO_SHOW no lo tocan.
     """
@@ -890,6 +989,10 @@ def update_appointment_status(
     if new_status in ACTIVE_STATUSES and previous not in ACTIVE_STATUSES:
         _check_overlap(db, apt.dentist_user_id, clinic_id,
                        apt.start_time_utc, apt.end_time_utc, exclude_id=appointment_id)
+        _check_dentro_de_horario(db, apt.dentist_user_id, clinic_id,
+                                 apt.start_time_utc, apt.end_time_utc)
+        _check_sin_bloqueo(db, apt.dentist_user_id, clinic_id,
+                           apt.start_time_utc, apt.end_time_utc)
 
     apt.status = new_status
     _add_audit(db, apt, user_id, previous.value, new_status.value, status_update.change_reason)

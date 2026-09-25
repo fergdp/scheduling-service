@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Enum, Text, Boolean, func, ForeignKey, CheckConstraint, Index
+from sqlalchemy import Column, Integer, String, DateTime, Time, Enum, Text, Boolean, func, ForeignKey, CheckConstraint, Index
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
 from datetime import datetime, timezone
@@ -64,6 +64,67 @@ class DentistCalendarConfig(Base):
 
     def __repr__(self):
         return f"<DentistCalendarConfig(dentist={self.dentist_user_id}, clinic={self.clinic_id})>"
+
+class DentistScheduleSlot(Base):
+    """
+    El horario semanal de un odontólogo: un rango recurrente en un día de la semana (#296).
+
+    Varias filas por día son normales (mañana y tarde con corte al mediodía, cada corte es
+    simplemente el hueco entre dos filas — no hace falta modelarlo aparte). Un odontólogo SIN
+    ninguna fila queda disponible siempre, igual que antes de este feature: la restricción es
+    opt-in por odontólogo (ver `_check_dentro_de_horario` en `routers/appointments.py`).
+    """
+    __tablename__ = "dentist_schedule_slots"
+
+    slot_id = Column(Integer, primary_key=True, autoincrement=True)
+    clinic_id = Column(Integer, nullable=False, index=True)
+    # Sin index=True acá: el índice compuesto de abajo ya arranca con dentist_user_id, así que
+    # cubre como left-prefix las consultas por dentist_user_id solo — uno aparte sería redundante.
+    dentist_user_id = Column(Integer, nullable=False)
+    weekday = Column(Integer, nullable=False)  # 0=lunes .. 6=domingo, como datetime.weekday()
+    start_time = Column(Time, nullable=False)
+    end_time = Column(Time, nullable=False)
+
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("start_time < end_time", name="chk_schedule_slot_time_range"),
+        CheckConstraint("weekday >= 0 AND weekday <= 6", name="chk_schedule_slot_weekday"),
+        Index("ix_dentist_schedule_slots_lookup", "dentist_user_id", "clinic_id", "weekday"),
+    )
+
+
+class DentistScheduleBlock(Base):
+    """
+    Un bloqueo puntual de agenda: vacaciones, un congreso, un trámite (#296). A diferencia del
+    horario semanal tiene fecha propia — mismo formato UTC naive que `Appointment`.
+
+    Crearlo se rechaza si pisa un turno ACTIVO (decisión de Fernando: nada se cancela ni se
+    mueve solo — hay que reprogramar/cancelar el turno primero, ver `_turnos_activos_en_rango`).
+    Borrado físico: a diferencia de un turno, nada lo referencia por FK y no hace falta que
+    quede en ningún historial ni estadística.
+    """
+    __tablename__ = "dentist_schedule_blocks"
+
+    block_id = Column(Integer, primary_key=True, autoincrement=True)
+    clinic_id = Column(Integer, nullable=False, index=True)
+    # Sin index=True acá: mismo motivo que en DentistScheduleSlot — el índice compuesto de
+    # abajo ya arranca con dentist_user_id.
+    dentist_user_id = Column(Integer, nullable=False)
+    start_time_utc = Column(DateTime, nullable=False)
+    end_time_utc = Column(DateTime, nullable=False)
+    reason = Column(Text, nullable=False)
+
+    created_by_user_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        CheckConstraint("start_time_utc < end_time_utc", name="chk_schedule_block_time_range"),
+        Index("ix_dentist_schedule_blocks_lookup", "dentist_user_id", "clinic_id", "start_time_utc"),
+    )
+
 
 class Appointment(Base):
     __tablename__ = "appointments"

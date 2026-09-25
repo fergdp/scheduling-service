@@ -1,7 +1,7 @@
 import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Optional
 from models import AppointmentStatus, FreedSlotReason, GcalSyncStatus, WaitlistStatus
 
@@ -324,3 +324,100 @@ class FreedSlotListResponse(BaseModel):
     # Cuántos esperan (lo que ve quien pide), para el contador del botón: así la pantalla hace
     # UN pedido por recarga y no dos.
     waiting_count: int
+
+
+# ---------------------------------------------------------------------------
+# Horario de atención y bloqueos de agenda (#296)
+# ---------------------------------------------------------------------------
+
+class ScheduleSlotIn(BaseModel):
+    weekday: int = Field(ge=0, le=6)
+    start_time: time
+    end_time: time
+
+    @model_validator(mode="after")
+    def rango_valido(self):
+        if self.end_time <= self.start_time:
+            raise ValueError("end_time must be after start_time")
+        return self
+
+
+class ScheduleSlotResponse(BaseModel):
+    slot_id: int
+    weekday: int
+    start_time: time
+    end_time: time
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ScheduleReplaceRequest(BaseModel):
+    """Reemplaza el horario semanal completo del odontólogo de una vez — no altas/bajas
+    sueltas: la UI natural es «esto es mi semana», no editar fila por fila."""
+    slots: list[ScheduleSlotIn]
+
+    @model_validator(mode="after")
+    def sin_superposicion(self):
+        por_dia: dict[int, list] = {}
+        for franja in self.slots:
+            por_dia.setdefault(franja.weekday, []).append(franja)
+        for dia, franjas in por_dia.items():
+            ordenadas = sorted(franjas, key=lambda f: f.start_time)
+            for anterior, actual in zip(ordenadas, ordenadas[1:]):
+                if actual.start_time < anterior.end_time:
+                    raise ValueError(f"overlapping ranges on weekday {dia}")
+        return self
+
+
+class ScheduleResponse(BaseModel):
+    slots: list[ScheduleSlotResponse]
+
+
+class ScheduleBlockCreate(BaseModel):
+    start_time_utc: datetime
+    end_time_utc: datetime
+    reason: str = Field(min_length=1, max_length=500)
+
+    @field_validator("start_time_utc")
+    @classmethod
+    def inicio_razonable(cls, v: datetime) -> datetime:
+        # Misma cota que `available_from_utc` de la lista de espera: sin esto entraban fechas
+        # como el año 1 o el 9999, que no son un bloqueo real sino un error de tipeo o de test.
+        return _desde_razonable(v)
+
+    @field_validator("end_time_utc")
+    @classmethod
+    def a_utc(cls, v: datetime) -> datetime:
+        return _a_utc(v)
+
+    @field_validator("reason")
+    @classmethod
+    def reason_no_vacio(cls, v: str) -> str:
+        # A diferencia de la nota de la lista de espera (opcional, ver _normalizar_nota), acá
+        # el motivo es obligatorio: "   " pasa min_length=1 pero no dice nada de por qué está
+        # bloqueada la franja.
+        v = v.strip()
+        if not v:
+            raise ValueError("reason cannot be blank")
+        return v
+
+    @model_validator(mode="after")
+    def rango_valido(self):
+        if self.end_time_utc <= self.start_time_utc:
+            raise ValueError("end_time_utc must be after start_time_utc")
+        return self
+
+
+class ScheduleBlockResponse(BaseModel):
+    block_id: int
+    dentist_user_id: int
+    start_time_utc: datetime
+    end_time_utc: datetime
+    reason: str
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ScheduleBlockListResponse(BaseModel):
+    blocks: list[ScheduleBlockResponse]
