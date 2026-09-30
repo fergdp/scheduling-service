@@ -22,6 +22,7 @@ from fastapi import HTTPException
 from sqlalchemy import and_, exists, or_, true
 from sqlalchemy.orm import Session
 
+from horario_atencion import bloqueo_que_pisa, cabe_en_horario
 from models import (
     ACTIVE_STATUSES, Appointment, FreedSlot, FreedSlotCloseReason, FreedSlotReason,
     WaitlistEntry, WaitlistStatus,
@@ -266,6 +267,27 @@ def _entra_adelantado(proximo: Appointment, inicio: datetime, fin: datetime,
     )
 
 
+def _hueco_disponible(db: Session, aviso: FreedSlot) -> bool:
+    """
+    Si el hueco que dejó `aviso` es uno que el backend aceptaría de verdad (#333): dentro del
+    horario semanal vigente del odontólogo y sin un bloqueo encima. Mismo criterio, mismas
+    funciones, que usa el router de turnos para rechazar (409) un turno fuera de horario o
+    sobre un bloqueo — si acá dijera otra cosa, el cartel ofrecería un hueco que «Darle el
+    turno» rechazaría apenas se lo tocara.
+
+    Los dos casos reales que lo vuelven inválido DESPUÉS de haberse liberado, sin que nada lo
+    cierre: el odontólogo angosta su horario semanal (la restricción no es retroactiva sobre
+    turnos ya activos, pero sí sobre qué huecos libres se ofrecen), o carga un bloqueo sobre una
+    franja que ya estaba libre (cargarlo no pasa por `cerrar_avisos_ocupados`, que sólo mira
+    turnos). El aviso en sí queda abierto en los dos casos — no hay por qué cerrarlo, alguno de
+    los dos cambios puede deshacerse y volvería a ser válido —, simplemente no se ofrece.
+    """
+    return (
+        cabe_en_horario(db, aviso.dentist_user_id, aviso.clinic_id, aviso.start_time_utc, aviso.end_time_utc)
+        and bloqueo_que_pisa(db, aviso.dentist_user_id, aviso.clinic_id, aviso.start_time_utc, aviso.end_time_utc) is None
+    )
+
+
 @dataclass
 class HuecoConCandidatos:
     aviso: FreedSlot
@@ -375,6 +397,10 @@ def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user
     """
     Los huecos que el cartel tiene que mostrar, cada uno con quién lo quiere.
 
+    Un hueco primero tiene que seguir siendo uno que el backend aceptaría (#333): dentro del
+    horario semanal vigente del odontólogo y sin un bloqueo encima (`_hueco_disponible`) — si no,
+    ni se calculan sus candidatos.
+
     Un candidato es una entrada que espera a ese odontólogo o a cualquiera, desde un día que no
     es posterior al hueco, cuyo paciente no es el que lo liberó ni tiene ya un turno que lo pise,
     y que **no tiene un turno anterior al hueco**: si ya tiene uno antes, no lo quiere. Si tiene
@@ -387,10 +413,11 @@ def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user
     recepción.
 
     ⚠️ **El tope cuenta avisos que alguien ve, no los que trae la consulta.** La consulta sólo sabe
-    que alguien «en principio» quiere cada aviso; lo de arriba (el que lo liberó, el que ya tiene
-    un turno antes, el que no entra) se decide acá y puede dejar sin candidatos a los primeros 50.
-    Como nadie los ve, nadie los descarta: tapaban para siempre a uno posterior que sí servía.
-    Se piden de a tandas, en orden, hasta juntar el tope o mirar `TANDAS_MAXIMAS`.
+    que alguien «en principio» quiere cada aviso; lo de arriba (fuera de horario o bloqueado, el
+    que lo liberó, el que ya tiene un turno antes, el que no entra) se decide acá y puede dejar sin
+    candidatos a los primeros 50. Como nadie los ve, nadie los descarta: tapaban para siempre a uno
+    posterior que sí servía. Se piden de a tandas, en orden, hasta juntar el tope o mirar
+    `TANDAS_MAXIMAS`.
     """
     ahora = ahora or ahora_utc()
     limite = LIMITE_AVISOS if limite is None else limite
@@ -425,6 +452,11 @@ def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user
             .all()
         )
         for aviso in avisos:
+            # #333: un hueco fuera del horario vigente o bloqueado no se ofrece — ver
+            # `_hueco_disponible`. Va ANTES de calcular candidatos porque es más barato (dos
+            # lookups por índice) y descarta sin gastar esa cuenta.
+            if not _hueco_disponible(db, aviso):
+                continue
             hueco = _candidatos_del_aviso(
                 db, clinic_id=clinic_id, aviso=aviso, entradas=entradas, por_paciente=por_paciente,
                 paciente_que_libero=paciente_que_libero, ahora=ahora, propio=propio, user_id=user_id,

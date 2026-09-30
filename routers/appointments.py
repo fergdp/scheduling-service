@@ -1,7 +1,6 @@
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
@@ -10,11 +9,11 @@ from dependencies import (
     get_db, get_clinic_id, get_user_id, get_roles, require_any_role, _resolve_db_clinic_id,
     telefonos_vigentes_de, key_por_usuario_o_ip,
 )
+from horario_atencion import cabe_en_horario, bloqueo_que_pisa, naive as _naive
 import lista_espera
 from models import (
     Appointment, DentistCalendarConfig, AppointmentStatus, ACTIVE_STATUSES,
     AppointmentAuditLog, FreedSlotReason, GcalSyncStatus,
-    DentistScheduleSlot, DentistScheduleBlock,
 )
 from schemas import (
     AppointmentCreate, AppointmentUpdate, AppointmentResponse,
@@ -34,13 +33,6 @@ router = APIRouter()
 limiter = Limiter(key_func=key_por_usuario_o_ip)
 
 _DEFAULT_DURATION_MINUTES = 30
-
-# El horario semanal (#296) se carga y se piensa en hora LOCAL de la clínica — un solo huso
-# para todo el sistema, mismo supuesto implícito que ya usa el resto (front incluido: el
-# browser muestra todo en su huso local sin que el backend necesite saberlo). Acá SÍ hace
-# falta saberlo: es la primera vez que este servicio compara "qué día/hora de la semana es"
-# en vez de sólo comparar instantes UTC entre sí.
-_HUSO_CLINICA = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # Estados desde los que un PACIENTE puede cancelar por el portal. Una vez que llegó a la
 # sala de espera (ARRIVED) o el turno ya cerró, cancelar es cosa del staff.
@@ -79,19 +71,6 @@ def _resolve_end_time(start: datetime, end: datetime | None, config) -> datetime
         if config else _DEFAULT_DURATION_MINUTES
     )
     return start + timedelta(minutes=duration)
-
-
-def _naive(dt: datetime) -> datetime:
-    """
-    Pasa un datetime a UTC naive, que es como lo guarda la columna (DateTime sin timezone).
-
-    ⚠️ **CONVIERTE, no recorta.** Hacer `replace(tzinfo=None)` guarda el reloj de pared: las
-    10:00 de Buenos Aires quedaban almacenadas como las 10:00 UTC, o sea tres horas corridas.
-    Eso corría el turno en la agenda de todos Y abría un agujero en el chequeo de solapamiento,
-    porque el mismo instante escrito con dos husos distintos daba dos horas distintas y los dos
-    turnos entraban. Lo fija `tests/test_integridad_turnos.py`.
-    """
-    return dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
 
 
 def _utcnow_naive() -> datetime:
@@ -284,54 +263,23 @@ def _check_overlap(db: Session, dentist_user_id: int, clinic_id: int,
 def _check_dentro_de_horario(db: Session, dentist_user_id: int, clinic_id: int,
                              start: datetime, end: datetime) -> None:
     """
-    Si el odontólogo tiene AL MENOS UNA fila en `dentist_schedule_slots`, el turno tiene que
-    caer entero dentro de UNA sola fila de ese día de la semana (#296) — así un turno que pisa
-    el corte del mediodía entre dos franjas se rechaza, no alcanza con que el inicio esté en
-    una franja y el fin en otra. Sin ninguna fila cargada, sigue disponible siempre: la
-    restricción es opt-in por odontólogo, no rompe a nadie que no configuró nada (decisión 4
-    del diseño).
-
-    ⚠️ `start`/`end` llegan en UTC; `DentistScheduleSlot.weekday`/`start_time`/`end_time` están
-    en hora LOCAL de la clínica (`_HUSO_CLINICA`). Hay que convertir ANTES de mirar día/hora —
-    comparar el UTC crudo contra una franja local rechaza turnos adentro del horario real y
-    acepta turnos fuera de él, corrido por el offset (encontrado por review, no en la primera
-    versión: los tests armaban horario y turno con el mismo reloj por construcción y el huso
-    nunca se ejercitaba).
+    El turno tiene que caer entero dentro de UNA sola fila del horario semanal de ese día
+    (#296) — así uno que pisa el corte del mediodía entre dos franjas se rechaza, no alcanza
+    con que el inicio esté en una franja y el fin en otra. Sin ninguna fila cargada, sigue
+    disponible siempre (decisión 4 del diseño). Mismo criterio exacto que usa
+    `lista_espera.huecos_con_candidatos` para no ofrecer un hueco que esto mismo rechazaría
+    (#333) — la cuenta vive en `horario_atencion.cabe_en_horario`, una sola vez.
     """
-    start, end = _naive(start), _naive(end)
-    tiene_horario = db.query(DentistScheduleSlot.slot_id).filter(
-        DentistScheduleSlot.dentist_user_id == dentist_user_id,
-        DentistScheduleSlot.clinic_id == clinic_id,
-    ).first() is not None
-    if not tiene_horario:
-        return
-
-    inicio_local = start.replace(tzinfo=timezone.utc).astimezone(_HUSO_CLINICA)
-    fin_local = end.replace(tzinfo=timezone.utc).astimezone(_HUSO_CLINICA)
-
-    cabe_en_alguna_franja = db.query(DentistScheduleSlot.slot_id).filter(
-        DentistScheduleSlot.dentist_user_id == dentist_user_id,
-        DentistScheduleSlot.clinic_id == clinic_id,
-        DentistScheduleSlot.weekday == inicio_local.weekday(),
-        DentistScheduleSlot.start_time <= inicio_local.time(),
-        DentistScheduleSlot.end_time >= fin_local.time(),
-    ).first() is not None
-    if not cabe_en_alguna_franja:
+    if not cabe_en_horario(db, dentist_user_id, clinic_id, start, end):
         raise HTTPException(status_code=409, detail="Fuera del horario de atención del odontólogo")
 
 
 def _check_sin_bloqueo(db: Session, dentist_user_id: int, clinic_id: int,
                        start: datetime, end: datetime) -> None:
     """El turno no puede pisar un bloqueo de agenda del odontólogo — vacaciones, congreso,
-    etc. (#296). Mismo predicado de solapamiento que `_armar_query_solapamiento`: pegados no
-    se pisan."""
-    start, end = _naive(start), _naive(end)
-    bloqueo = db.query(DentistScheduleBlock).filter(
-        DentistScheduleBlock.dentist_user_id == dentist_user_id,
-        DentistScheduleBlock.clinic_id == clinic_id,
-        DentistScheduleBlock.start_time_utc < end,
-        DentistScheduleBlock.end_time_utc > start,
-    ).first()
+    etc. (#296). Mismo motivo que `_check_dentro_de_horario`: la cuenta vive en
+    `horario_atencion.bloqueo_que_pisa`, que también usa `lista_espera` (#333)."""
+    bloqueo = bloqueo_que_pisa(db, dentist_user_id, clinic_id, start, end)
     if bloqueo:
         raise HTTPException(
             status_code=409,

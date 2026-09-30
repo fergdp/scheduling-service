@@ -7,7 +7,7 @@ de FastAPI se reemplazan en la app entera, así que dos fixtures activas a la ve
 como el último usuario creado.
 """
 import contextlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +22,7 @@ from models import (
     WaitlistEntry, WaitlistStatus,
 )
 from test_agenda_recepcion import BASE, _db, _patch
+from test_dentist_schedule import _futuro, _insertar_block_db, _insertar_slot_db, _naive_utc
 
 W = "/clinic-scheduling-api/v1/waitlist"
 RECEPCION = (50, ["RECEPTIONIST"])
@@ -551,6 +552,87 @@ def test_al_que_libero_el_hueco_no_se_le_ofrece(receptionist_client):
     apt = _turno(_utc(10), paciente=5)
     assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
     assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+
+
+# ---------------------------------------------------------------------------
+# #333 — un hueco fuera del horario vigente o bloqueado no se ofrece
+# ---------------------------------------------------------------------------
+
+def test_un_hueco_fuera_del_horario_vigente_no_se_ofrece(receptionist_client):
+    """
+    El odontólogo angostó su horario DESPUÉS de que este turno quedó activo (no es retroactivo:
+    ver `_check_dentro_de_horario`) — el turno igual se puede cancelar, pero el hueco que deja
+    ya no es uno que el backend fuera a aceptar: 'Darle el turno' lo rechazaría con 409.
+
+    El horario se carga DIRECTO a la base (`_insertar_slot_db`), no con el cliente del propio
+    odontólogo: dos fixtures `client*` activas a la vez se pisan (`_insertar_block_db` ya lo
+    documenta arriba), y acá hace falta `receptionist_client` para anotar y leer el cartel.
+    """
+    inicio_local = _futuro(10, 15, 0)   # 15hs: fuera de la franja 9-13 que se carga abajo
+    _insertar_slot_db(1, inicio_local.weekday(), time(9, 0), time(13, 0))
+    _id_anotado(receptionist_client, 6, dentist=1)
+
+    apt = _turno(_naive_utc(inicio_local), paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+
+
+def test_un_hueco_dentro_del_horario_vigente_se_sigue_ofreciendo(receptionist_client):
+    """Control positivo del test anterior: con horario cargado, un hueco que SÍ cae adentro no
+    se pierde por el filtro nuevo."""
+    inicio_local = _futuro(10, 10, 0)   # 10hs: adentro de la franja 9-13
+    _insertar_slot_db(1, inicio_local.weekday(), time(9, 0), time(13, 0))
+    candidato = _id_anotado(receptionist_client, 6, dentist=1)
+
+    apt = _turno(_naive_utc(inicio_local), paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert [c["entry_id"] for c in hueco["candidates"]] == [candidato]
+
+
+def test_un_hueco_bloqueado_despues_de_liberarse_no_se_ofrece(receptionist_client):
+    """
+    El turno se cancela primero (deja el aviso abierto) y el odontólogo bloquea esa franja
+    DESPUÉS, porque en ese momento ya estaba libre (cargar un bloqueo exige que no haya turnos
+    activos ahí). Cargar el bloqueo no pasa por `cerrar_avisos_ocupados` —sólo mira turnos—, así
+    que sin este filtro el aviso seguía ofreciendo una franja que ahora está bloqueada.
+    """
+    inicio = _utc(10)
+    apt = _turno(inicio, paciente=5)
+    assert _patch(receptionist_client, apt, "CANCELLED").status_code == 200
+    _id_anotado(receptionist_client, 6, dentist=1)
+
+    # `_insertar_block_db` convierte con `.astimezone()`, que sobre un naive asume la zona
+    # LOCAL de la máquina: `inicio` (de `_utc`, ya UTC pero sin tzinfo) necesita el tzinfo
+    # explícito para no correrse por el offset — mismo motivo que documenta `naive()`.
+    con_tz = inicio.replace(tzinfo=timezone.utc)
+    _insertar_block_db(1, con_tz, con_tz + timedelta(hours=1), reason="Vacaciones")
+
+    assert receptionist_client.get(f"{W}/slots").json()["slots"] == []
+
+
+def test_el_filtro_de_horario_es_por_odontologo_no_global(receptionist_client):
+    """
+    El odontólogo 1 tiene un horario restrictivo cargado (sólo 9-13) y su hueco a las 15hs no se
+    ofrece (mismo caso que arriba). El odontólogo 2 no cargó ningún horario — sigue disponible
+    siempre (decisión 4 del #296) — y su hueco, a la MISMA hora, se sigue ofreciendo con
+    normalidad: el filtro nuevo lee el horario de `aviso.dentist_user_id`, no uno global.
+    """
+    inicio_local = _futuro(10, 15, 0)
+    _insertar_slot_db(1, inicio_local.weekday(), time(9, 0), time(13, 0))
+    _id_anotado(receptionist_client, 6, dentist=1)
+    candidato_2 = _id_anotado(receptionist_client, 7, dentist=2)
+
+    apt1 = _turno(_naive_utc(inicio_local), dentist=1, paciente=5)
+    apt2 = _turno(_naive_utc(inicio_local), dentist=2, paciente=9)
+    assert _patch(receptionist_client, apt1, "CANCELLED").status_code == 200
+    assert _patch(receptionist_client, apt2, "CANCELLED").status_code == 200
+
+    [hueco] = receptionist_client.get(f"{W}/slots").json()["slots"]
+    assert hueco["dentist_user_id"] == 2
+    assert [c["entry_id"] for c in hueco["candidates"]] == [candidato_2]
 
 
 def test_quien_ya_tiene_turno_antes_no_lo_quiere_y_quien_lo_tiene_despues_se_adelanta(receptionist_client):
