@@ -18,6 +18,8 @@ Lo que fija este archivo:
 7. **La cota de abajo del chequeo de solapamiento (#309) no excluye un choque real.**
 8. **El tope de 8 h lo hace cumplir la base, no sólo Python (#319, #321)** — y `models.py` dice lo
    mismo que las migraciones, y ninguna lo saca.
+9. **Las claves foráneas de las migraciones tienen el tipo de la columna que referencian (#344)**,
+   que es lo que exige MySQL y SQLite no mira.
 """
 import functools
 import os
@@ -538,3 +540,155 @@ def test_el_check_en_otra_base_avisa_donde_agregarlo():
 
     with pytest.raises(NotImplementedError, match="agregarla en models.py"):
         CreateTable(Appointment.__table__).compile(dialect=postgresql.dialect())
+
+
+# ---------------------------------------------------------------------------
+# 9. Las claves foráneas de las migraciones tienen el tipo de lo que referencian (#344)
+# ---------------------------------------------------------------------------
+
+# `nombre TIPO`. El largo o el ancho entre paréntesis no se guarda —MySQL no lo compara en una clave
+# foránea—; el `UNSIGNED` sí: `BIGINT` y `BIGINT UNSIGNED` no son lo mismo.
+_COLUMNA = r"`?(\w+)`? (\w+)(?:\([^)]*\))?( unsigned)?"
+# Con el nombre de índice que MySQL deja poner entre `FOREIGN KEY` y el paréntesis.
+_CLAVE_FORANEA = r"foreign key(?: `?\w+`?)? ?\(`?(\w+)`?\) references `?(\w+)`? ?\(`?(\w+)`?\)"
+# Lo que en un `CREATE TABLE` o un `ALTER TABLE` empieza con una palabra y no es una columna.
+_NO_ES_COLUMNA = r"(primary key|unique|constraint|check|index|key|foreign|drop|rename|alter)\b"
+
+
+def _tipo(columna):
+    """El tipo como lo compara MySQL en una clave foránea: `INT` es `INTEGER`."""
+    base = columna.group(2).upper()
+    return ("INTEGER" if base == "INT" else base) + (columna.group(3) or "").upper()
+
+
+def _partes(cuerpo):
+    """Un `CREATE TABLE` o un `ALTER TABLE`, cortado en las comas que no están entre paréntesis."""
+    partes, nivel, actual = [], 0, ""
+    for caracter in cuerpo:
+        if caracter == "," and nivel == 0:
+            partes.append(actual.strip())
+            actual = ""
+            continue
+        nivel += (caracter == "(") - (caracter == ")")
+        actual += caracter
+    return partes + [actual.strip()]
+
+
+def _claves_foraneas_de_otro_tipo(sentencias):
+    """
+    Las claves foráneas del SQL cuya columna no tiene el tipo de la que referencia, como texto.
+
+    Lee las columnas y las claves de los `CREATE TABLE` y de los `ALTER TABLE ... ADD | MODIFY |
+    CHANGE`. Lo que no sabe leer —una clave compuesta, una columna que no encuentra— lo dice
+    fallando, no lo saltea. No sigue las claves que una migración saca después: las compara igual.
+    """
+    tipos, claves = {}, []
+    for sentencia in sentencias:
+        creada = re.match(r"create table `?(\w+)`? \((.*)\)", sentencia, re.IGNORECASE)
+        alterada = re.match(r"alter table `?(\w+)`? (.*)", sentencia, re.IGNORECASE)
+        if not (creada or alterada):
+            continue
+        tabla, cuerpo = (creada or alterada).groups()
+        for parte in _partes(cuerpo):
+            parte = re.sub(r"^(add|modify)( column)? ", "", parte, flags=re.IGNORECASE)
+            # `CHANGE vieja nueva TIPO`: el tipo nuevo vale también para el nombre viejo, que es el
+            # que guardan las claves ya leídas.
+            cambiada = re.match(r"change(?: column)? `?(\w+)`? ", parte, re.IGNORECASE)
+            if cambiada:
+                parte = parte[cambiada.end():]
+            clave = re.search(_CLAVE_FORANEA, parte, re.IGNORECASE)
+            columna = re.match(_COLUMNA, parte, re.IGNORECASE)
+            if clave:
+                claves.append((tabla, *clave.groups()))
+            elif columna and not re.match(_NO_ES_COLUMNA, parte, re.IGNORECASE):
+                tipos[tabla, columna.group(1)] = _tipo(columna)
+                if cambiada:
+                    tipos[tabla, cambiada.group(1)] = _tipo(columna)
+
+    declaradas = sum(len(re.findall(r"(?<!drop )foreign key\b", s, re.IGNORECASE)) for s in sentencias)
+    assert len(claves) == declaradas, f"el SQL declara {declaradas} claves foráneas y se leyeron {len(claves)}"
+    sin_tipo = [clave for clave in claves if clave[:2] not in tipos or clave[2:] not in tipos]
+    assert not sin_tipo, f"no se encontró el tipo de alguna columna de estas claves: {sin_tipo}"
+    return [
+        f"{tabla}.{columna} {tipos[tabla, columna]} -> {otra}.{referida} {tipos[otra, referida]}"
+        for tabla, columna, otra, referida in claves
+        if tipos[tabla, columna] != tipos[otra, referida]
+    ]
+
+
+def test_las_claves_foraneas_de_las_migraciones_tienen_el_tipo_de_lo_que_referencian():
+    """
+    MySQL exige que la columna de una clave foránea tenga exactamente el tipo de la referenciada
+    (error 3780) y SQLite no, así que el resto de la suite no lo ve. Pasó con `7b3e9c1f5a2d`: en
+    modo offline armaba las dos claves a `appointments` con `INTEGER`, contra un `BIGINT` (#344).
+    """
+    assert _claves_foraneas_de_otro_tipo(_sql_de_las_migraciones()) == []
+
+
+@pytest.mark.parametrize("de_otro_tipo, despues", [
+    # Una tabla más, con la clave a `appointments` en `INTEGER`: armada en el `CREATE TABLE`...
+    ("notas.appointment_id INTEGER", (
+        "CREATE TABLE notas ( nota_id INTEGER NOT NULL AUTO_INCREMENT, appointment_id INTEGER NOT NULL,"
+        " PRIMARY KEY (nota_id), FOREIGN KEY(appointment_id) REFERENCES appointments (appointment_id) )",
+    )),
+    # ... sumada después con `ALTER TABLE`...
+    ("notas.appointment_id INTEGER", (
+        "CREATE TABLE notas ( nota_id INTEGER NOT NULL AUTO_INCREMENT, PRIMARY KEY (nota_id) )",
+        "ALTER TABLE notas ADD COLUMN appointment_id INTEGER NOT NULL",
+        "ALTER TABLE notas ADD CONSTRAINT fk_notas_turno FOREIGN KEY(appointment_id)"
+        " REFERENCES appointments (appointment_id)",
+    )),
+    # ... o con nombre de índice.
+    ("notas.appointment_id INTEGER", (
+        "CREATE TABLE notas ( nota_id INTEGER NOT NULL AUTO_INCREMENT, appointment_id INTEGER, PRIMARY KEY"
+        " (nota_id), FOREIGN KEY ix_turno (appointment_id) REFERENCES appointments (appointment_id) )",
+    )),
+    # Lo único distinto es el signo.
+    ("notas.appointment_id BIGINT UNSIGNED", (
+        "CREATE TABLE notas ( nota_id INTEGER NOT NULL AUTO_INCREMENT, appointment_id BIGINT UNSIGNED,"
+        " PRIMARY KEY (nota_id), FOREIGN KEY(appointment_id) REFERENCES appointments (appointment_id) )",
+    )),
+    # Una clave que estaba bien, y una migración posterior le cambia el tipo a la columna: lo que
+    # genera `op.alter_column` (con y sin nombre nuevo) y lo mismo escrito a mano.
+    ("waitlist_entries.appointment_id INTEGER", (
+        "ALTER TABLE waitlist_entries CHANGE appointment_id turno_id INTEGER NULL",
+    )),
+    ("waitlist_entries.appointment_id INTEGER", (
+        "ALTER TABLE waitlist_entries MODIFY appointment_id INTEGER NULL",
+    )),
+    ("waitlist_entries.appointment_id INTEGER", (
+        "alter table waitlist_entries change column appointment_id appointment_id int null",
+    )),
+])
+def test_el_guard_ve_una_clave_foranea_de_otro_tipo(de_otro_tipo, despues):
+    """Control positivo: las mismas sentencias, más algo que deja una clave a `appointments` con un
+    tipo que no es el suyo."""
+    assert _claves_foraneas_de_otro_tipo(_sql_de_las_migraciones() + despues) == [
+        f"{de_otro_tipo} -> appointments.appointment_id BIGINT",
+    ]
+
+
+@pytest.mark.parametrize("despues", [
+    # El ancho no cuenta.
+    ("CREATE TABLE notas ( nota_id INTEGER NOT NULL, appointment_id BIGINT(20), PRIMARY KEY (nota_id),"
+     " FOREIGN KEY(appointment_id) REFERENCES appointments (appointment_id) )",),
+    # `INT` es `INTEGER`, y el largo de un texto tampoco cuenta.
+    ("CREATE TABLE salas ( sala_id INT NOT NULL, codigo VARCHAR(36) NOT NULL, PRIMARY KEY (sala_id) )",
+     "CREATE TABLE reservas ( sala_id INTEGER, codigo VARCHAR(50), FOREIGN KEY(sala_id) REFERENCES salas"
+     " (sala_id), FOREIGN KEY(codigo) REFERENCES salas (codigo) )"),
+    # Sacar una clave no descuadra la cuenta de las que hay que leer.
+    ("ALTER TABLE waitlist_entries DROP FOREIGN KEY waitlist_entries_ibfk_1",),
+])
+def test_el_guard_no_marca_una_clave_foranea_que_mysql_acepta(despues):
+    """Control negativo: escrituras distintas del mismo tipo no son un tipo distinto."""
+    assert _claves_foraneas_de_otro_tipo(_sql_de_las_migraciones() + despues) == []
+
+
+@pytest.mark.parametrize("mensaje, despues", [
+    ("se leyeron", ("CREATE TABLE pares ( a BIGINT, b BIGINT, FOREIGN KEY(a, b) REFERENCES otra (x, y) )",)),
+    ("no se encontró el tipo", ("CREATE TABLE sueltas ( x BIGINT, FOREIGN KEY(x) REFERENCES no_existe (id) )",)),
+])
+def test_el_guard_no_saltea_una_clave_foranea_que_no_sabe_leer(mensaje, despues):
+    """Una clave compuesta, o a una tabla que el SQL no crea: tiene que fallar, no pasar de largo."""
+    with pytest.raises(AssertionError, match=mensaje):
+        _claves_foraneas_de_otro_tipo(_sql_de_las_migraciones() + despues)

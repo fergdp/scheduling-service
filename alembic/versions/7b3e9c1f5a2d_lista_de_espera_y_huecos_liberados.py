@@ -27,15 +27,16 @@ def _tipo_del_id_de_turno():
     """
     El tipo REAL de `appointments.appointment_id` en esta base.
 
-    ⚠️ No es el mismo en todos lados: la migración inicial lo crea `INTEGER`, pero la base local
-    de desarrollo lo tiene `BIGINT` (se creó por otro camino). MySQL exige que la columna de una
-    clave foránea tenga exactamente el tipo de la referenciada, y con `sa.Integer()` fijo el
-    `CREATE TABLE` falla con el error 3780. Se lee de la base en vez de suponerlo.
+    ⚠️ Es `BIGINT` en toda base armada con estas migraciones: así lo crea la inicial
+    (`01496af57eb6`). El que dice `Integer` es `models.py`, y copiarlo de ahí no sirve: MySQL exige
+    que la columna de una clave foránea tenga exactamente el tipo de la referenciada, y con
+    `sa.Integer()` fijo el `CREATE TABLE` falla con el error 3780. Igual se lee de la base en vez
+    de suponerlo, por si alguna no salió de estas migraciones.
     """
     # `alembic upgrade --sql` (modo offline) no tiene base a la que preguntar: ahí va el tipo de
-    # la migración inicial, que es el de las bases creadas con Alembic.
+    # la migración inicial, que es el de toda base armada con estas migraciones (#344).
     if context.is_offline_mode():
-        return sa.Integer()
+        return sa.BigInteger()
     columnas = sa.inspect(op.get_bind()).get_columns('appointments')
     return next(c['type'] for c in columnas if c['name'] == 'appointment_id')
 
