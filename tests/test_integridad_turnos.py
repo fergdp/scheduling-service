@@ -16,7 +16,16 @@ Lo que fija este archivo:
 5. **El lock pesimista existe de verdad** en la base de producción.
 6. **Un evento huérfano en Google no se disfraza de sincronizado.**
 7. **La cota de abajo del chequeo de solapamiento (#309) no excluye un choque real.**
+8. **El tope de 8 h lo hace cumplir la base, no sólo Python (#319, #321)** — y `models.py` dice lo
+   mismo que las migraciones, y ninguna lo saca.
 """
+import functools
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -349,3 +358,185 @@ def test_una_reasignacion_sin_problemas_queda_sincronizada(receptionist_client, 
     fila = _fila(apt_id)
     assert fila["gcal_sync_status"] == GcalSyncStatus.SYNCED
     assert fila["google_event_id"], "tiene que tener el evento nuevo del odontólogo 2"
+
+
+# ---------------------------------------------------------------------------
+# 8. El tope de 8 h también lo hace cumplir la base (#319, #321)
+# ---------------------------------------------------------------------------
+
+CHECK_DURACION = "chk_appointments_max_duration"
+RAIZ = Path(__file__).resolve().parent.parent
+
+# La tabla, con o sin esquema y con o sin comillas invertidas (las sentencias ya vienen con un
+# solo espacio entre palabras).
+_TABLA = r"(?:`?\w+`?\.)?`?appointments`?(?![\w`])"
+# Una sentencia que se lleva la tabla, y con ella el CHECK: borrarla o renombrarla, sola o en una
+# lista, en mayúsculas o en minúsculas. `RENAME COLUMN`, `RENAME INDEX` y `RENAME KEY` son otra cosa.
+_SE_VA_LA_TABLA = re.compile(
+    rf"^drop table (?:if exists )?(?:.*, ?)?{_TABLA}"
+    rf"|^rename table (?:.*, ?)?{_TABLA} to\b"
+    rf"|^alter table {_TABLA} (?:.*, ?)?rename (?!column\b|index\b|key\b)",
+    re.IGNORECASE,
+)
+_SE_AGREGA_EL_CHECK = re.compile(
+    rf"alter table {_TABLA} add constraint `?{CHECK_DURACION}`? check \((.+)\)", re.IGNORECASE,
+)
+
+
+def _turno_que_dura(duracion):
+    """
+    Un turno insertado DIRECTO en la base, sin pasar por `_validate_times`: es justo lo que el CHECK
+    tiene que frenar — una migración, un script a mano, un endpoint nuevo que se olvide de validar.
+    """
+    inicio = datetime(2030, 1, 7, 9, 0)
+    return Appointment(
+        clinic_id=1, dentist_user_id=1, patient_user_id=5, patient_name="Paciente Test",
+        start_time_utc=inicio, end_time_utc=inicio + duracion,
+    )
+
+
+def test_la_base_rechaza_un_turno_de_mas_de_8_horas():
+    """
+    Antes del #321 el CHECK existía sólo en la migración de MySQL: la suite (SQLite) no lo creaba,
+    así que borrarlo o romperlo no ponía ningún test en rojo. Ahora lo declara `models.py`, y SQLite
+    lo hace cumplir.
+    """
+    from sqlalchemy.exc import IntegrityError
+    db = _db()
+    try:
+        # Un segundo de más: el borde exacto, para que no sobreviva un tope corrido unos segundos.
+        db.add(_turno_que_dura(timedelta(hours=8, seconds=1)))
+        with pytest.raises(IntegrityError, match=CHECK_DURACION):
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_la_base_acepta_un_turno_de_exactamente_8_horas():
+    """El borde es inclusivo: 8 h justas entran (`<=`, igual que la migración)."""
+    db = _db()
+    try:
+        db.add(_turno_que_dura(timedelta(hours=8)))
+        db.commit()
+    finally:
+        db.close()
+
+
+@functools.lru_cache(maxsize=None)
+def _sql_de_las_migraciones():
+    """
+    El SQL que corre `alembic upgrade head` contra MySQL, sentencia por sentencia y sin los
+    comentarios, generado sin conectarse a ninguna base (modo offline, `--sql`).
+
+    Se mira el SQL y no el código de las migraciones: da igual CÓMO una migración nueva tocara el
+    CHECK —`drop_constraint`, SQL crudo, el nombre armado en un f-string o en un helper, la tabla
+    recreada—, en el SQL sale igual. De paso queda fijado que las migraciones se generan offline,
+    algo que ya se cuidaba (`7b3e9c1f5a2d` no le pregunta a la base en ese modo).
+
+    En otro proceso, porque `env.py` llama a `load_dotenv()`: en éste dejaría las variables del
+    `.env` cargadas para el resto de la suite. Y sin escribir bytecode: hay `.pyc` de alembic en
+    git, y cada corrida los dejaría modificados.
+    """
+    salida = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
+        cwd=RAIZ, capture_output=True, encoding="utf-8", timeout=120,
+        env={**os.environ, "DATABASE_URL": "mysql+pymysql://offline@localhost/offline",
+             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"},
+    )
+    assert salida.returncode == 0, (
+        "`alembic upgrade head --sql` (sin base) falló. Si una migración nueva le pregunta algo a la"
+        " base, que lo saltee con `context.is_offline_mode()`, como `7b3e9c1f5a2d`:\n" + salida.stderr
+    )
+    lineas = [linea for linea in salida.stdout.splitlines() if not linea.startswith("--")]
+    return tuple(" ".join(s.split()) for s in " ".join(lineas).split(";") if s.strip())
+
+
+def _check_que_queda(sentencias):
+    """
+    La expresión del CHECK de duración después de la última sentencia, o `None` si no queda.
+
+    Cualquier sentencia que lo nombre y no sea agregarlo cuenta como que lo saca: si algún día se lo
+    cambia a propósito, este test se cambia a propósito.
+    """
+    expresion = None
+    for sentencia in sentencias:
+        if _SE_VA_LA_TABLA.match(sentencia):
+            expresion = None
+        elif CHECK_DURACION in sentencia.lower():
+            agregado = _SE_AGREGA_EL_CHECK.fullmatch(sentencia)
+            expresion = agregado.group(1) if agregado else None
+    return expresion
+
+
+def test_las_migraciones_dejan_puesto_el_tope_de_duracion():
+    """
+    Si una migración nueva lo saca por error, el tope deja de valer en producción y la cota de abajo
+    del chequeo de solapamiento (#309, que asume turnos de 8 h como mucho) puede volver a dejar
+    choques afuera sin que ningún otro test lo note.
+    """
+    assert _check_que_queda(_sql_de_las_migraciones()) is not None
+
+
+@pytest.mark.parametrize("despues", [
+    "ALTER TABLE appointments DROP CHECK chk_appointments_max_duration",       # drop_constraint en MySQL
+    "ALTER TABLE appointments DROP CONSTRAINT chk_appointments_max_duration",  # en MariaDB, o a mano
+    "alter table appointments drop check chk_appointments_max_duration",
+    "ALTER TABLE appointments ALTER CHECK chk_appointments_max_duration NOT ENFORCED",
+    "DROP TABLE appointments",
+    "drop table appointments",
+    "DROP TABLE dental_scheduling_db.appointments",
+    "DROP TABLE appointments_viejos, appointments",
+    "ALTER TABLE appointments RENAME turnos",                                  # rename_table
+    "alter table appointments rename to turnos",
+    "ALTER TABLE appointments ADD COLUMN x INT, RENAME TO turnos",
+    "RENAME TABLE appointments TO turnos",
+    "rename table appointments to turnos",
+    "RENAME TABLE otra TO otra2, appointments TO turnos",
+])
+def test_el_guard_ve_que_una_migracion_lo_saca(despues):
+    """
+    Control positivo: las mismas sentencias, con una más al final que saca el CHECK. Sin esto, una
+    forma de sacarlo que el parseo no reconociera dejaría el test de arriba en verde con el CHECK ya
+    ido.
+    """
+    assert _check_que_queda(_sql_de_las_migraciones() + (despues,)) is None
+
+
+@pytest.mark.parametrize("despues", [
+    "ALTER TABLE appointments RENAME COLUMN reason TO motivo",
+    "ALTER TABLE appointments ADD COLUMN sala INTEGER",
+    "DROP TABLE appointments_viejos",
+    "RENAME TABLE appointments_nuevos TO appointments_viejos",
+])
+def test_el_guard_no_confunde_otra_sentencia_con_sacarlo(despues):
+    """Control negativo: tocar la tabla, o borrar otra que empieza igual, no saca el CHECK."""
+    assert _check_que_queda(_sql_de_las_migraciones() + (despues,)) is not None
+
+
+@pytest.mark.parametrize("url_dialecto", ["mysql+pymysql://", "mariadb+pymysql://"])
+def test_el_check_de_duracion_es_el_de_la_migracion(url_dialecto):
+    """
+    `models.py` y las migraciones tienen que decir LO MISMO: si alguien cambia uno sin el otro, una
+    base armada con `create_all()` y una armada con Alembic tendrían reglas distintas. Se compila la
+    tabla contra el dialecto real y se compara con el CHECK que dejan las migraciones.
+
+    `mariadb` aparte: SQLAlchemy lo reporta como otro dialecto, y sin su versión el CHECK no compila.
+    """
+    from sqlalchemy.engine import make_url
+    from sqlalchemy.schema import CreateTable
+
+    expresion = _check_que_queda(_sql_de_las_migraciones())
+    dialecto = make_url(url_dialecto).get_dialect()()
+    ddl = " ".join(str(CreateTable(Appointment.__table__).compile(dialect=dialecto)).split())
+    assert f"CONSTRAINT {CHECK_DURACION} CHECK ({expresion})" in ddl, ddl
+
+
+def test_el_check_en_otra_base_avisa_donde_agregarlo():
+    """Con una base para la que el CHECK no tiene versión, armar la tabla falla diciendo dónde
+    agregarla, en vez de crearla sin el tope."""
+    from sqlalchemy.dialects import postgresql
+    from sqlalchemy.schema import CreateTable
+
+    with pytest.raises(NotImplementedError, match="agregarla en models.py"):
+        CreateTable(Appointment.__table__).compile(dialect=postgresql.dialect())

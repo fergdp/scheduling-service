@@ -1,5 +1,7 @@
 from sqlalchemy import Column, Integer, String, DateTime, Time, Enum, Text, Boolean, func, ForeignKey, CheckConstraint, Index
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, relationship
+from sqlalchemy.sql.expression import ColumnElement
 import enum
 from datetime import datetime, timezone
 
@@ -17,6 +19,53 @@ def _ahora_utc() -> datetime:
 
 class Base(DeclarativeBase):
     pass
+
+
+# Lo más largo que puede durar un turno, 8 h. De acá sale `lista_espera.DURACION_MAXIMA_TURNO`, el
+# tope que aplica `_validate_times` en el router de turnos y del que depende la cota del chequeo de
+# solapamiento (#309): la base y Python no pueden decir cosas distintas.
+DURACION_MAXIMA_TURNO_SEGUNDOS = 8 * 60 * 60
+
+
+class _DuracionMaximaTurno(ColumnElement):
+    """
+    `fin - inicio <= 8 h`: el CHECK `chk_appointments_max_duration` (#319, #321).
+
+    La migración `c6fe51fd89ff` lo crea en MySQL con `TIMESTAMPDIFF`, que SQLite no tiene: escrito
+    tal cual acá, `Base.metadata.create_all()` reventaba en toda la suite. Por eso se arma según la
+    base — y así la suite, que corre en SQLite, también lo hace cumplir, en vez de que la única
+    protección sea la verificación a mano del día de la migración.
+    """
+    # Sin estado propio: la clave de caché es la clase sola. Sin esto, `inherit_cache` sólo callaba
+    # el aviso de SQLAlchemy, y la expresión no se cacheaba.
+    _traverse_internals = []
+    inherit_cache = True
+    type = Boolean()
+
+
+@compiles(_DuracionMaximaTurno, "mysql")
+@compiles(_DuracionMaximaTurno, "mariadb")
+def _duracion_maxima_mysql(element, compiler, **kw):
+    # El mismo texto que la migración: lo exige `test_el_check_de_duracion_es_el_de_la_migracion`.
+    # `mariadb` aparte: SQLAlchemy lo reporta como otro dialecto, y sin él este CHECK no compilaba.
+    return f"TIMESTAMPDIFF(SECOND, start_time_utc, end_time_utc) <= {DURACION_MAXIMA_TURNO_SEGUNDOS}"
+
+
+@compiles(_DuracionMaximaTurno, "sqlite")
+def _duracion_maxima_sqlite(element, compiler, **kw):
+    # Segundos ENTEROS (`strftime('%s')`), no `julianday`: con flotantes, un turno de 8 h justas
+    # puede dar 28800.00001 y rechazarse.
+    return (
+        "CAST(strftime('%s', end_time_utc) AS INTEGER) - CAST(strftime('%s', start_time_utc) AS INTEGER)"
+        f" <= {DURACION_MAXIMA_TURNO_SEGUNDOS}"
+    )
+
+
+@compiles(_DuracionMaximaTurno)
+def _duracion_maxima_otra_base(element, compiler, **kw):
+    raise NotImplementedError(
+        f"chk_appointments_max_duration no tiene versión para {compiler.dialect.name}: agregarla en models.py"
+    )
 
 class AppointmentStatus(enum.Enum):
     # Los tres "activos" ocupan el hueco del odontólogo; los otros tres lo liberan.
@@ -165,6 +214,7 @@ class Appointment(Base):
 
     __table_args__ = (
         CheckConstraint("start_time_utc < end_time_utc", name="chk_appointments_time_range"),
+        CheckConstraint(_DuracionMaximaTurno(), name="chk_appointments_max_duration"),
     )
 
 class AppointmentAuditLog(Base):

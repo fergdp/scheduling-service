@@ -24,13 +24,14 @@ from sqlalchemy.orm import Session
 
 from horario_atencion import bloqueo_que_pisa, cabe_en_horario
 from models import (
-    ACTIVE_STATUSES, Appointment, FreedSlot, FreedSlotCloseReason, FreedSlotReason,
-    WaitlistEntry, WaitlistStatus,
+    ACTIVE_STATUSES, DURACION_MAXIMA_TURNO_SEGUNDOS, Appointment, FreedSlot, FreedSlotCloseReason,
+    FreedSlotReason, WaitlistEntry, WaitlistStatus,
 )
 
-# Lo más largo que puede durar un turno (`_validate_times`, en el router de turnos). Sirve de cota
-# para buscar avisos que se pisan con un horario: uno que empieza más de 8 h antes no llega.
-DURACION_MAXIMA_TURNO = timedelta(hours=8)
+# Lo más largo que puede durar un turno (`_validate_times`, en el router de turnos): el mismo tope
+# que el CHECK de la base, declarado en `models.py`. Sirve de cota para buscar avisos que se pisan
+# con un horario: uno que empieza más de 8 h antes no llega.
+DURACION_MAXIMA_TURNO = timedelta(seconds=DURACION_MAXIMA_TURNO_SEGUNDOS)
 
 # Cuántos avisos devuelve el cartel como mucho. Los de más adelante aparecen cuando se resuelven
 # los primeros: una recepcionista no va a ofrecer 50 huecos a la vez, y sin tope un aviso lejano
