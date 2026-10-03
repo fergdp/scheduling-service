@@ -435,14 +435,12 @@ def _sql_de_las_migraciones():
     algo que ya se cuidaba (`7b3e9c1f5a2d` no le pregunta a la base en ese modo).
 
     En otro proceso, porque `env.py` llama a `load_dotenv()`: en éste dejaría las variables del
-    `.env` cargadas para el resto de la suite. Y sin escribir bytecode: hay `.pyc` de alembic en
-    git, y cada corrida los dejaría modificados.
+    `.env` cargadas para el resto de la suite.
     """
     salida = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head", "--sql"],
         cwd=RAIZ, capture_output=True, encoding="utf-8", timeout=120,
-        env={**os.environ, "DATABASE_URL": "mysql+pymysql://offline@localhost/offline",
-             "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1"},
+        env={**os.environ, "DATABASE_URL": "mysql+pymysql://offline@localhost/offline", "PYTHONUTF8": "1"},
     )
     assert salida.returncode == 0, (
         "`alembic upgrade head --sql` (sin base) falló. Si una migración nueva le pregunta algo a la"
