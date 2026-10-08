@@ -215,6 +215,10 @@ class Appointment(Base):
     __table_args__ = (
         CheckConstraint("start_time_utc < end_time_utc", name="chk_appointments_time_range"),
         CheckConstraint(_DuracionMaximaTurno(), name="chk_appointments_max_duration"),
+        # «¿Qué turnos tienen por delante estos pacientes?» (#355, y la lista de espera): entra por
+        # la clínica y el paciente y lee sólo de hoy en adelante. Lo crea la migración
+        # `a7c4e9d2b6f3`; acá se declara para que el modelo diga lo mismo que la base.
+        Index("ix_appointments_clinic_patient_start", "clinic_id", "patient_user_id", "start_time_utc"),
     )
 
 class AppointmentAuditLog(Base):

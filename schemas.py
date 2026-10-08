@@ -2,7 +2,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from datetime import datetime, time, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 from models import AppointmentStatus, FreedSlotReason, GcalSyncStatus, WaitlistStatus
 
 # Forma mínima de un mail: algo, arroba, dominio con punto. No valida que exista.
@@ -191,6 +191,66 @@ class AppointmentStatusUpdate(BaseModel):
 class AppointmentListResponse(BaseModel):
     appointments: list[AppointmentResponse]
     total: int
+
+
+# ---------------------------------------------------------------------------
+# Próximos turnos de varios pacientes (#355)
+# ---------------------------------------------------------------------------
+
+# Cuántos pacientes se pueden preguntar de una vez. La pantalla que tenga más los pide en tandas.
+PROXIMOS_MAXIMO_DE_PACIENTES = 200
+
+# Lo más grande que entra en una columna BIGINT. Un id más grande no existe, y sin este tope el
+# número llega hasta la base (en SQLite, la de los tests, eso es un 500).
+_ID_MAXIMO = 2**63 - 1
+
+# Un id de paciente tal como viaja en este pedido: un entero de verdad. `strict` deja afuera a
+# `true` (que si no se toma por el paciente 1), a "5" y a 5.0: quien arma el pedido tiene los ids
+# como números, y cualquier otra cosa es un pedido mal armado.
+IdDePaciente = Annotated[int, Field(strict=True, gt=0, le=_ID_MAXIMO)]
+
+
+class UpcomingByPatientRequest(BaseModel):
+    """
+    De qué pacientes se quiere saber si ya tienen turno. Los repetidos cuentan una sola vez; una
+    lista vacía es válida y devuelve una respuesta vacía.
+
+    ⚠️ Rechaza las claves que no conoce, a diferencia del resto de este servicio. Con esta respuesta
+    una pantalla decide a quién NO llamar: un filtro mal escrito (o uno que todavía no existe)
+    ignorado en silencio devolvería todo, y la pantalla lo tomaría por filtrado.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    patient_ids: list[IdDePaciente] = Field(..., max_length=PROXIMOS_MAXIMO_DE_PACIENTES)
+
+
+class UpcomingAppointment(BaseModel):
+    """
+    Lo mínimo de un turno para decir «ya tiene turno, tal día, con tal profesional». A propósito no
+    trae el motivo ni las observaciones: esta respuesta la ve también quien no es el odontólogo del
+    turno.
+    """
+    appointment_id: int
+    dentist_user_id: int
+    # UTC, sin huso, como en el resto del servicio. Puede estar en el pasado: el turno en curso cuenta.
+    start_time_utc: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class PatientUpcomingAppointments(BaseModel):
+    patient_user_id: int
+    # El próximo turno del paciente con cada odontólogo, del más cercano al más lejano. Vacía si no
+    # tiene ninguno. No es «todos sus turnos»: con un mismo odontólogo viene sólo el primero.
+    next_by_dentist: list[UpcomingAppointment]
+
+
+class UpcomingByPatientResponse(BaseModel):
+    """
+    Un objeto y no una lista suelta, para poder sumarle datos sin romper a quien ya la usa.
+    Trae una entrada por cada paciente pedido, en el orden en que se pidieron.
+    """
+    patients: list[PatientUpcomingAppointments]
 
 
 # ---------------------------------------------------------------------------

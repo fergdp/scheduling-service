@@ -17,7 +17,8 @@ from models import (
 )
 from schemas import (
     AppointmentCreate, AppointmentUpdate, AppointmentResponse,
-    AppointmentStatusUpdate, AppointmentListResponse
+    AppointmentStatusUpdate, AppointmentListResponse,
+    UpcomingByPatientRequest, UpcomingByPatientResponse,
 )
 from utils.google_calendar import (
     get_calendar_service, get_free_busy, create_google_event,
@@ -531,6 +532,61 @@ def get_upcoming_appointments(
         .all()
     )
     return {"appointments": _con_telefonos_vigentes(appointments), "total": len(appointments)}
+
+
+# `get_clinic_id` antes que el guard de rol: sin sesión tiene que salir 401, no el 403 de «roles
+# vacíos» (ver el POST de más abajo).
+@router.post("/upcoming-by-patient", response_model=UpcomingByPatientResponse,
+             dependencies=[Depends(get_clinic_id), require_any_role("ADMIN", "RECEPTIONIST", "DENTIST")])
+@limiter.limit("60/minute")
+def upcoming_appointments_by_patient(
+    request: Request,
+    pedido: UpcomingByPatientRequest,
+    db: Session = Depends(get_db),
+    clinic_id: int = Depends(get_clinic_id),
+):
+    """
+    De un grupo de pacientes, quién ya tiene turno (#355): por cada uno, su próximo turno con cada
+    odontólogo, del más cercano al más lejano. Lo usa Ortodoncia para no ofrecerle un turno de
+    control a quien ya lo tiene.
+
+    Es un POST aunque sólo lee (el único de este servicio): los ids de los pacientes van en el
+    cuerpo y no en la dirección, que queda escrita en los registros del servidor.
+
+    **Uno por odontólogo, y no «los tres primeros»**: quien pregunta puede querer saber si tiene
+    turno con cualquiera o con SU odontólogo. Cortando por fecha, el turno con su ortodoncista
+    podía quedar afuera por venir cuarto; así no se pierde ninguno, y el primero de la lista es
+    siempre el más próximo de todos.
+
+    Cuenta lo mismo que la lista de espera: los turnos que ocupan un hueco (programado, confirmado,
+    en espera) y todavía no terminaron. Uno cancelado, ausente, atendido o borrado no es «tener
+    turno». El que está en curso sí: a ese paciente lo están atendiendo, y su `start_time_utc` ya
+    pasó. (`GET /upcoming`, el del tablero, es otra cosa: el turno entero, sólo los que todavía no
+    empezaron, y acotado por rol.)
+
+    El alcance por profesional **no se aplica a propósito**, igual que en la lista con
+    `patient_user_id`: la pregunta es por el paciente, y «no tiene turno» tiene que ser cierto
+    aunque el turno sea con otro odontólogo de la clínica. Por eso cada turno dice con quién es, y
+    por eso no trae nada más que eso y el horario.
+
+    Un id que no es de esta clínica vuelve sin turnos, igual que un paciente que no tiene ninguno:
+    no se puede usar para averiguar si un id existe en otra.
+    """
+    pacientes = list(dict.fromkeys(pedido.patient_ids))  # sin repetidos, en el orden pedido
+    por_paciente = lista_espera.turnos_futuros_por_paciente(db, clinic_id, set(pacientes), _utcnow_naive())
+    return {"patients": [
+        {"patient_user_id": paciente,
+         "next_by_dentist": _el_proximo_con_cada_odontologo(por_paciente.get(paciente, []))}
+        for paciente in pacientes
+    ]}
+
+
+def _el_proximo_con_cada_odontologo(turnos: list[Appointment]) -> list[Appointment]:
+    """De los turnos de un paciente, que vienen del más próximo al más lejano, el primero con cada odontólogo."""
+    primeros: dict[int, Appointment] = {}
+    for turno in turnos:
+        primeros.setdefault(turno.dentist_user_id, turno)
+    return list(primeros.values())
 
 
 @router.get("/", response_model=AppointmentListResponse)

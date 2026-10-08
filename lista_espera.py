@@ -195,22 +195,42 @@ def contar_esperando(db: Session, *, clinic_id: int, roles: list[str], user_id: 
     return _query_entradas_esperando(db, clinic_id=clinic_id, roles=roles, user_id=user_id).count()
 
 
-def _turnos_futuros_por_paciente(db: Session, clinic_id: int, pacientes: set[int],
-                                 ahora: datetime) -> dict[int, list[Appointment]]:
+def armar_query_turnos_futuros(db: Optional[Session], clinic_id: int, pacientes: set[int], ahora: datetime):
+    """
+    La consulta de `turnos_futuros_por_paciente`, separada para poder mirarla sin base de datos
+    (los tests corren en SQLite; el índice que la sostiene vive en MySQL).
+
+    «Todavía no terminó» es `end_time_utc > ahora`, y ese filtro solo no usa ningún índice. La
+    cota sobre el inicio no cambia el resultado —un turno dura como mucho DURACION_MAXIMA_TURNO, así
+    que uno que empezó antes de esa cota ya terminó—, pero deja que MySQL entre por
+    `ix_appointments_clinic_patient_start` (clínica, paciente, inicio) y lea, de cada paciente, sólo
+    de hoy en adelante. Mismo criterio que la cota del solapamiento (#309).
+    """
+    sesion = db if db is not None else Session()
+    return (
+        _turnos_activos(sesion, clinic_id)
+        .filter(and_(
+            Appointment.patient_user_id.in_(sorted(pacientes)),
+            Appointment.start_time_utc > ahora - DURACION_MAXIMA_TURNO,
+            Appointment.end_time_utc > ahora,
+        ))
+        .order_by(Appointment.start_time_utc.asc(), Appointment.appointment_id.asc())
+    )
+
+
+def turnos_futuros_por_paciente(db: Session, clinic_id: int, pacientes: set[int],
+                                ahora: datetime) -> dict[int, list[Appointment]]:
     """
     Los turnos activos que todavía no terminaron de cada paciente, del más próximo al más lejano.
-    Incluye el que está en curso: no cuenta como próximo, pero sí como choque de horario.
+    Incluye el que está en curso: para la lista de espera no cuenta como próximo, pero sí como
+    choque de horario; para «¿ya tiene turno?» (#355) sí cuenta.
+
+    Un paciente sin turnos no está en el resultado. Una sola consulta para todos.
     """
     if not pacientes:
         return {}
-    turnos = (
-        _turnos_activos(db, clinic_id)
-        .filter(and_(Appointment.patient_user_id.in_(sorted(pacientes)), Appointment.end_time_utc > ahora))
-        .order_by(Appointment.start_time_utc.asc(), Appointment.appointment_id.asc())
-        .all()
-    )
     por_paciente: dict[int, list[Appointment]] = defaultdict(list)
-    for turno in turnos:
+    for turno in armar_query_turnos_futuros(db, clinic_id, pacientes, ahora).all():
         por_paciente[turno.patient_user_id].append(turno)
     return por_paciente
 
@@ -232,7 +252,7 @@ def proximos_turnos(db: Session, *, clinic_id: int, entradas: list[WaitlistEntry
                     ahora: Optional[datetime] = None) -> dict[int, Optional[Appointment]]:
     """El próximo turno de cada entrada, por `entry_id`. Una sola consulta para toda la lista."""
     ahora = ahora or ahora_utc()
-    por_paciente = _turnos_futuros_por_paciente(db, clinic_id, {e.patient_user_id for e in entradas}, ahora)
+    por_paciente = turnos_futuros_por_paciente(db, clinic_id, {e.patient_user_id for e in entradas}, ahora)
     return {e.entry_id: _proximo_turno(e, por_paciente.get(e.patient_user_id, []), ahora) for e in entradas}
 
 
@@ -439,7 +459,7 @@ def huecos_con_candidatos(db: Session, *, clinic_id: int, roles: list[str], user
         if entradas is None:
             # La lista entera de la clínica, con los permisos de la recepción: ver el docstring.
             entradas = entradas_esperando(db, clinic_id=clinic_id, roles=["RECEPTIONIST"], user_id=user_id)
-            por_paciente = _turnos_futuros_por_paciente(
+            por_paciente = turnos_futuros_por_paciente(
                 db, clinic_id, {e.patient_user_id for e in entradas}, ahora,
             )
 
