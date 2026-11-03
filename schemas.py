@@ -170,6 +170,10 @@ class AppointmentResponse(BaseModel):
     appointment_id: int
     clinic_id: int
     dentist_user_id: int
+    # El nombre del odontólogo, de `users` (#508): el paciente no puede leer la lista del personal,
+    # y sin esto veía «Od. #4032». Lo arman las rutas que devuelven el turno; en `None` si no lo
+    # encontraron.
+    dentist_name: Optional[str] = None
     patient_user_id: int
     patient_name: Optional[str] = None
     # Teléfono para llamar o recordar por WhatsApp desde la ficha del turno. Las rutas de

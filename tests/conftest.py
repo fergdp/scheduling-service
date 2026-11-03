@@ -80,6 +80,9 @@ def sin_telefonos_vigentes(monkeypatch):
     # contacto. `test_contacto.py` pisa esto donde prueba la regla.
     monkeypatch.setattr(ra, "_datos_de_contacto", lambda patient_user_ids, clinic_id: {})
     monkeypatch.setattr(rw, "_datos_de_contacto", lambda patient_user_ids, clinic_id: {})
+    # El nombre del odontólogo (#508) también lee `users`: sin datos, el turno sale sin el nombre.
+    # `test_nombre_del_odontologo.py` pisa esto donde lo prueba.
+    monkeypatch.setattr(ra, "_nombres_de_odontologos", lambda user_ids, clinic_id: {})
 
 def _sembrar_csrf(c):
     """

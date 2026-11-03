@@ -17,6 +17,8 @@ from sqlalchemy.pool import StaticPool
 
 import contacto
 import dependencies
+# El de verdad: el fixture del `conftest` lo reemplaza en cada test.
+from routers.appointments import _nombres_de_odontologos as NOMBRES_DE_VERDAD
 from test_agenda_recepcion import BASE, _insert
 from test_lista_espera import W, _id_anotado
 
@@ -89,9 +91,15 @@ def test_es_menor(nacimiento, hoy, esperado):
 # La consulta, contra las tablas de verdad
 # ---------------------------------------------------------------------------
 
+# Los roles de producción, escritos como allá (medidos el 2026-07-27: `db-reality.properties` de
+# dental-clinic). Con otros nombres, un filtro que nombrara también a un asistente o a un
+# administrador pasaría en verde.
+ROLES = {"admin": 1, "dentist": 2, "dentist_assistant": 3, "GUEST": 4, "patient": 5, "receptionist": 6, "user": 7}
+
+
 @pytest.fixture
 def base_de_la_clinica(monkeypatch):
-    """Un SQLite con `users` y `patient_guardians`, con las columnas que lee la consulta."""
+    """Un SQLite con `users`, `patient_guardians` y los roles, con las columnas que leen las consultas."""
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     with engine.begin() as cx:
         cx.execute(text(
@@ -102,6 +110,11 @@ def base_de_la_clinica(monkeypatch):
             "CREATE TABLE patient_guardians (dependent_user_id INTEGER, guardian_user_id INTEGER, "
             "relationship TEXT, clinic_id INTEGER)"
         ))
+        # Los roles, para el nombre del odontólogo (#508): sólo se nombra a quien tiene `dentist`.
+        cx.execute(text("CREATE TABLE roles (role_id INTEGER PRIMARY KEY, role_name TEXT)"))
+        cx.execute(text("CREATE TABLE users_roles (user_id INTEGER, role_id INTEGER)"))
+        for nombre, role_id in ROLES.items():
+            cx.execute(text("INSERT INTO roles VALUES (:id, :nombre)"), {"id": role_id, "nombre": nombre})
     monkeypatch.setattr(dependencies, "ClinicSessionLocal", sessionmaker(bind=engine))
 
     def sql(sentencia, **datos):
@@ -110,15 +123,63 @@ def base_de_la_clinica(monkeypatch):
     return sql
 
 
-def _usuario(sql, user_id, clinic_id=1, nombre="N", apellido="A", telefono=None, nacimiento=None, baja=None):
+def _usuario(sql, user_id, clinic_id=1, nombre="N", apellido="A", telefono=None, nacimiento=None, baja=None,
+             roles=()):
     sql(
         "INSERT INTO users VALUES (:id, :clinica, :nombre, :apellido, :tel, :nac, :baja)",
         id=user_id, clinica=clinic_id, nombre=nombre, apellido=apellido, tel=telefono, nac=nacimiento, baja=baja,
     )
+    for rol in roles:
+        # Con `ROLES[rol]`, un rol mal escrito corta el test; un INSERT … SELECT no insertaría nada.
+        sql("INSERT INTO users_roles VALUES (:id, :rol)", id=user_id, rol=ROLES[rol])
 
 
 def _vinculo(sql, paciente, tutor, clinic_id=1):
     sql("INSERT INTO patient_guardians VALUES (:p, :t, 'PARENT', :c)", p=paciente, t=tutor, c=clinic_id)
+
+
+def test_nombres_de_trae_a_los_odontologos_de_la_clinica_tambien_al_dado_de_baja(base_de_la_clinica):
+    sql = base_de_la_clinica
+    _usuario(sql, 1, nombre="Laura", apellido="Aguirre", roles=["dentist"])
+    _usuario(sql, 2, nombre="Pablo", apellido="Funes", baja="2026-10-01 10:00:00", roles=["dentist"])
+    _usuario(sql, 3, clinic_id=2, nombre="De", apellido="Otra", roles=["dentist"])
+
+    assert contacto.nombres_de([1, 2, 3], 1) == {1: "Laura Aguirre", 2: "Pablo Funes"}
+
+
+def test_nombres_de_no_nombra_a_nadie_que_no_sea_odontologo(base_de_la_clinica):
+    """Aunque un turno tenga cargada a otra persona, el paciente no recibe su nombre. La dueña, que es
+    administradora y odontóloga, sí: cuenta que tenga el rol, no que sea el único."""
+    sql = base_de_la_clinica
+    _usuario(sql, 1, nombre="Laura", apellido="Aguirre", roles=["admin", "dentist"])
+    _usuario(sql, 4, nombre="Paula", apellido="Ortiz", roles=["receptionist"])
+    _usuario(sql, 5, nombre="Otro", apellido="Paciente", roles=["patient"])
+    _usuario(sql, 6, nombre="Sin", apellido="Rol")
+    _usuario(sql, 7, nombre=" ", apellido="", roles=["dentist"])
+    _usuario(sql, 8, nombre="Sólo", apellido="Administra", roles=["admin"])
+    _usuario(sql, 9, nombre="La", apellido="Asistente", roles=["dentist_assistant"])
+
+    assert contacto.nombres_de([1, 4, 5, 6, 7, 8, 9], 1) == {1: "Laura Aguirre"}
+
+
+def test_nombres_de_sin_ids_no_consulta(monkeypatch):
+    def no_deberia(*_):
+        raise AssertionError("consultó la base sin ids")
+    monkeypatch.setattr(dependencies, "ClinicSessionLocal", no_deberia)
+    assert contacto.nombres_de([], 1) == {}
+    assert contacto.nombres_de([None], 1) == {}
+
+
+def test_nombres_de_si_la_consulta_falla_devuelve_vacio_y_queda_un_error_sin_datos(base_de_la_clinica, caplog):
+    sql = base_de_la_clinica
+    sql("DROP TABLE users")
+
+    with caplog.at_level("ERROR", logger="contacto"):
+        assert contacto.nombres_de([1], 1) == {}
+    [registro] = [r for r in caplog.records if r.name == "contacto"]
+    assert registro.levelname == "ERROR"
+    assert "OperationalError" in registro.getMessage()
+    assert "users" not in registro.getMessage()  # El mensaje de la base no se copia
 
 
 def test_trae_los_tutores_de_cada_paciente_en_orden(base_de_la_clinica):
@@ -247,6 +308,24 @@ def test_la_lista_de_espera_dice_a_quien_escribirle(receptionist_client, monkeyp
 
     entrada = receptionist_client.get(f"{W}/").json()["entries"][0]
     assert entrada["contacto"] == {"es_tutor": True, "nombre": "Ana Gómez", "telefono": "351 555-1111"}
+
+
+def test_el_nombre_del_odontologo_sale_de_la_base_de_verdad(patient_client, base_de_la_clinica, monkeypatch):
+    """La ruta con la consulta real (#508): sin el reemplazo del `conftest` y con la función que el
+    router tiene de verdad. La odontóloga del turno trae su nombre; un odontólogo de otra clínica, no."""
+    import routers.appointments as ra
+    monkeypatch.setattr(ra, "_nombres_de_odontologos", NOMBRES_DE_VERDAD)
+    sql = base_de_la_clinica
+    _usuario(sql, 1, nombre="Laura", apellido="Aguirre", roles=["dentist"])
+    _usuario(sql, 3, clinic_id=2, nombre="De", apellido="Otra", roles=["dentist"])
+    propio = _insert(dentist_user_id=1, patient_user_id=10)
+    de_otra = _insert(dentist_user_id=3, patient_user_id=10, days_ahead=2)
+
+    res = patient_client.get(f"{BASE}/")
+    assert res.status_code == 200
+    nombres = {a["appointment_id"]: a["dentist_name"] for a in res.json()["appointments"]}
+    assert nombres[propio] == "Laura Aguirre"
+    assert nombres[de_otra] is None
 
 
 # ---------------------------------------------------------------------------

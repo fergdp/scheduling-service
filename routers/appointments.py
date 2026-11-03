@@ -51,6 +51,9 @@ _telefonos_vigentes = telefonos_vigentes_de
 
 # Y a quién va el WhatsApp (#417): lee `users` y `patient_guardians`, que tampoco están ahí.
 _datos_de_contacto = contacto.datos_de_contacto
+# El nombre del odontólogo de cada turno (#508). En módulo, como los otros dos, para que los tests
+# lo reemplacen: la base de tests no tiene `users`.
+_nombres_de_odontologos = contacto.nombres_de
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +136,7 @@ def _load_appointment(db: Session, appointment_id: int, clinic_id: int, con_lock
     return apt
 
 
-def _con_telefono_vigente(apt: Appointment, telefonos: dict, contactos: dict) -> AppointmentResponse:
+def _con_telefono_vigente(apt: Appointment, telefonos: dict, contactos: dict, nombres: dict) -> AppointmentResponse:
     """
     El turno como `AppointmentResponse`, con `patient_phone` reemplazado por el vigente si
     `users` tiene uno (#313). Si no —paciente sin teléfono cargado hoy, o que ya no está en la
@@ -147,13 +150,18 @@ def _con_telefono_vigente(apt: Appointment, telefonos: dict, contactos: dict) ->
     if vigente:
         resp.patient_phone = vigente
     resp.contacto = contacto.contacto_de(apt.patient_user_id, resp.patient_name, resp.patient_phone, contactos)
+    # Y el nombre del odontólogo (#508), con los datos de `_nombres_de_odontologos`.
+    resp.dentist_name = nombres.get(apt.dentist_user_id)
     return resp
 
 
 def _uno_con_telefono_vigente(apt: Appointment) -> AppointmentResponse:
     """Un turno solo, con su teléfono y su contacto: lo que devuelven las rutas de un turno."""
     ids = {apt.patient_user_id}
-    return _con_telefono_vigente(apt, _telefonos_vigentes(ids), _datos_de_contacto(ids, apt.clinic_id))
+    return _con_telefono_vigente(
+        apt, _telefonos_vigentes(ids), _datos_de_contacto(ids, apt.clinic_id),
+        _nombres_de_odontologos({apt.dentist_user_id}, apt.clinic_id),
+    )
 
 
 def _con_telefonos_vigentes(appointments: list[Appointment]) -> list[AppointmentResponse]:
@@ -162,9 +170,12 @@ def _con_telefonos_vigentes(appointments: list[Appointment]) -> list[Appointment
     telefonos = _telefonos_vigentes(ids)
     # Una página es de una sola clínica (la del JWT); por las dudas, una consulta por clínica.
     contactos = {}
+    nombres = {}
     for clinica in {a.clinic_id for a in appointments}:
-        contactos.update(_datos_de_contacto({a.patient_user_id for a in appointments if a.clinic_id == clinica}, clinica))
-    return [_con_telefono_vigente(a, telefonos, contactos) for a in appointments]
+        de_la_clinica = [a for a in appointments if a.clinic_id == clinica]
+        contactos.update(_datos_de_contacto({a.patient_user_id for a in de_la_clinica}, clinica))
+        nombres.update(_nombres_de_odontologos({a.dentist_user_id for a in de_la_clinica}, clinica))
+    return [_con_telefono_vigente(a, telefonos, contactos, nombres) for a in appointments]
 
 
 def _is_staff_for(apt: Appointment, roles: list[str], user_id: int) -> bool:

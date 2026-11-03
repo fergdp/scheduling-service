@@ -144,6 +144,52 @@ def datos_de_contacto(patient_user_ids, clinic_id) -> dict:
     return datos
 
 
+def nombres_de(user_ids, clinic_id) -> dict:
+    """
+    El nombre de cada odontólogo de la clínica, `{id: "Nombre Apellido"}`: el del odontólogo de cada
+    turno, para que el paciente vea con quién es (#508). El paciente no puede leer la lista del
+    personal de dental-clinic, y sin esto veía «Od. #4032». Una consulta para toda la página.
+
+    - Sólo de la clínica de quien pide (la del turno).
+    - Sólo de quien tiene el rol de odontólogo, que es a quien nombra la lista del personal. Si un
+      turno tuviera cargada a otra persona del equipo, sale sin el nombre, como lo ve el personal
+      («Od. #id»): el paciente no recibe el nombre de nadie más. El rol se compara en minúsculas,
+      como en quoting (`datos_clinica.py`).
+    - Uno dado de baja también viene: el turno viejo sigue siendo con él.
+    - ⚠️ Si la consulta falla, anota un ERROR y devuelve un mapa vacío: el turno sale sin el
+      nombre, como antes del #508. La agenda no se cae por eso.
+    """
+    ids = sorted({i for i in user_ids if i})
+    if not ids:
+        return {}
+
+    db = dependencies.ClinicSessionLocal()
+    try:
+        filas = db.execute(
+            text(
+                "SELECT u.user_id, u.first_name, u.last_name FROM users u "
+                "WHERE u.user_id IN :ids AND u.clinic_id = :c AND EXISTS ("
+                "  SELECT 1 FROM users_roles ur JOIN roles r ON r.role_id = ur.role_id"
+                "  WHERE ur.user_id = u.user_id AND LOWER(r.role_name) = 'dentist')"
+            ).bindparams(bindparam("ids", expanding=True)),
+            {"ids": ids, "c": clinic_id},
+        ).all()
+    except SQLAlchemyError as exc:
+        # Sin el mensaje de la base: puede traer valores. Con el tipo alcanza para buscarlo.
+        logger.error("No se pudieron leer los nombres de los odontólogos (%s): el turno sale sin el nombre",
+                     type(exc).__name__)
+        return {}
+    finally:
+        db.close()
+
+    nombres = {}
+    for user_id, first_name, last_name in filas:
+        nombre = _nombre(first_name, last_name)
+        if nombre:
+            nombres[user_id] = nombre
+    return nombres
+
+
 def _fecha(valor) -> Optional[date]:
     """MySQL devuelve `date`; SQLite, el texto. Una fecha ilegible es «no se sabe»."""
     if isinstance(valor, datetime):
