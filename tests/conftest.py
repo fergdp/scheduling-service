@@ -76,6 +76,10 @@ def sin_telefonos_vigentes(monkeypatch):
     import routers.waitlist as rw
     monkeypatch.setattr(ra, "_telefonos_vigentes", lambda patient_user_ids: {})
     monkeypatch.setattr(rw, "_telefonos_vigentes", lambda patient_user_ids: {})
+    # A quién va el WhatsApp (#417) lee las mismas tablas: sin datos, cada paciente es su propio
+    # contacto. `test_contacto.py` pisa esto donde prueba la regla.
+    monkeypatch.setattr(ra, "_datos_de_contacto", lambda patient_user_ids, clinic_id: {})
+    monkeypatch.setattr(rw, "_datos_de_contacto", lambda patient_user_ids, clinic_id: {})
 
 def _sembrar_csrf(c):
     """

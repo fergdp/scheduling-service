@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import and_, or_, true
 from sqlalchemy.orm import Session
 
+import contacto
 import lista_espera
 from dependencies import (
     get_clinic_id, get_db, get_roles, get_user_id, require_any_role, telefonos_vigentes_de,
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 # Mismo motivo que `routers/appointments.py`: el teléfono vigente (#313) sale de `users`, tabla
 # que la base de tests no tiene. Acá cubre el mismo bug en la lista de espera (#314).
 _telefonos_vigentes = telefonos_vigentes_de
+
+# Y a quién va el WhatsApp del hueco liberado (#417): `users` y `patient_guardians`.
+_datos_de_contacto = contacto.datos_de_contacto
 
 # ⚠️ Guard de rol en el ROUTER, no endpoint por endpoint: filtrar por `clinic_id` no alcanza,
 # porque un PACIENTE también trae `clinic_id` en su JWT (#261). La lista tiene nombres y
@@ -51,17 +55,23 @@ _SOLO_SU_LISTA = "Un odontólogo sólo puede anotar pacientes en su propia lista
 _NO_ENCONTRADA = "Waiting list entry not found"
 
 
-def _respuesta(entrada: WaitlistEntry, proximo=None, telefonos: dict | None = None) -> WaitlistEntryResponse:
+def _respuesta(entrada: WaitlistEntry, proximo, telefonos: dict | None, contactos: dict) -> WaitlistEntryResponse:
     """
     La entrada como `WaitlistEntryResponse`, con `patient_phone` reemplazado por el vigente si
     `telefonos` tiene uno (#314). Si no, se deja el guardado al anotar: mejor un número viejo
     que ninguno — mismo criterio que `_con_telefono_vigente` en `routers/appointments.py`.
+
+    Y con `contacto` (#417), con los datos de `_datos_de_contacto`. Obligatorio a propósito: pedirlo
+    acá adentro, entrada por entrada, haría N consultas en una lista.
     """
     respuesta = WaitlistEntryResponse.model_validate(entrada, from_attributes=True)
     respuesta.next_appointment = AppointmentBrief.model_validate(proximo) if proximo is not None else None
     vigente = (telefonos or {}).get(entrada.patient_user_id)
     if vigente:
         respuesta.patient_phone = vigente
+    respuesta.contacto = contacto.contacto_de(
+        entrada.patient_user_id, respuesta.patient_name, respuesta.patient_phone, contactos,
+    )
     return respuesta
 
 
@@ -124,9 +134,11 @@ def list_waitlist(
     """Quienes esperan, en orden de llegada, cada uno con su próximo turno si tiene."""
     entradas = lista_espera.entradas_esperando(db, clinic_id=clinic_id, roles=roles, user_id=user_id)
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=entradas)
-    telefonos = _telefonos_vigentes({e.patient_user_id for e in entradas})
+    ids = {e.patient_user_id for e in entradas}
+    telefonos = _telefonos_vigentes(ids)
+    contactos = _datos_de_contacto(ids, clinic_id)
     return {
-        "entries": [_respuesta(e, proximos.get(e.entry_id), telefonos) for e in entradas],
+        "entries": [_respuesta(e, proximos.get(e.entry_id), telefonos, contactos) for e in entradas],
         "total": len(entradas),
     }
 
@@ -175,7 +187,8 @@ def add_to_waitlist(
 
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=[entrada])
     telefonos = _telefonos_vigentes({entrada.patient_user_id})
-    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos)
+    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos,
+                      _datos_de_contacto({entrada.patient_user_id}, clinic_id))
 
 
 @router.get("/slots", response_model=FreedSlotListResponse)
@@ -194,9 +207,9 @@ def list_freed_slots(
     """
     huecos = lista_espera.huecos_con_candidatos(db, clinic_id=clinic_id, roles=roles, user_id=user_id)
     # Un solo `IN` para todos los candidatos de TODOS los avisos, no uno por hueco.
-    telefonos = _telefonos_vigentes(
-        entrada.patient_user_id for h in huecos for entrada, _ in h.candidatos
-    )
+    ids = {entrada.patient_user_id for h in huecos for entrada, _ in h.candidatos}
+    telefonos = _telefonos_vigentes(ids)
+    contactos = _datos_de_contacto(ids, clinic_id)
     return {
         "slots": [
             {
@@ -207,7 +220,7 @@ def list_freed_slots(
                 "reason": h.aviso.reason,
                 "created_at": h.aviso.created_at,
                 "can_dismiss": h.puede_descartar,
-                "candidates": [_respuesta(entrada, proximo, telefonos) for entrada, proximo in h.candidatos],
+                "candidates": [_respuesta(entrada, proximo, telefonos, contactos) for entrada, proximo in h.candidatos],
             }
             for h in huecos
         ],
@@ -302,7 +315,8 @@ def update_waitlist_entry(
 
     proximos = lista_espera.proximos_turnos(db, clinic_id=clinic_id, entradas=[entrada])
     telefonos = _telefonos_vigentes({entrada.patient_user_id})
-    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos)
+    return _respuesta(entrada, proximos.get(entrada.entry_id), telefonos,
+                      _datos_de_contacto({entrada.patient_user_id}, clinic_id))
 
 
 @router.delete("/{entry_id}", status_code=204)

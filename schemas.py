@@ -155,6 +155,17 @@ class AppointmentUpdate(BaseModel):
         return v
 
 
+class ContactoParaEscribir(BaseModel):
+    """
+    A quién va el WhatsApp de un turno o de la lista de espera (#417): al paciente o al adulto que
+    lo tiene a cargo, con la regla de `contacto.py`. `es_tutor` dice si quien lee el mensaje no es
+    el paciente (entonces hay que nombrarlo). `telefono` puede faltar.
+    """
+    es_tutor: bool
+    nombre: Optional[str] = None
+    telefono: Optional[str] = None
+
+
 class AppointmentResponse(BaseModel):
     appointment_id: int
     clinic_id: int
@@ -165,6 +176,9 @@ class AppointmentResponse(BaseModel):
     # lectura lo reemplazan por el vigente en `users` cuando lo tienen (#313); esto es sólo
     # el guardado al crear el turno, que queda como respaldo si el paciente no tiene uno hoy.
     patient_phone: Optional[str] = None
+    # A quién va el WhatsApp (#417). Lo arman las rutas que devuelven el turno; en `None` sólo si
+    # una ruta no lo pidió.
+    contacto: Optional[ContactoParaEscribir] = None
     start_time_utc: datetime
     end_time_utc: datetime
     patient_timezone: str
@@ -349,6 +363,8 @@ class WaitlistEntryResponse(BaseModel):
     # el vigente en `users` cuando lo tienen (#314, mismo mecanismo que AppointmentResponse en
     # #313); esto es sólo el guardado al anotar, que queda como respaldo si no hay uno hoy.
     patient_phone: Optional[str] = None
+    # A quién va el WhatsApp del hueco liberado (#417), igual que en `AppointmentResponse`.
+    contacto: Optional[ContactoParaEscribir] = None
     dentist_user_id: Optional[int] = None
     available_from_utc: datetime
     note: Optional[str] = None
