@@ -62,7 +62,7 @@ jobs:
 
       # Paso 1: Copiar el artefacto al VPS usando SCP
       - name: Copy artifact to VPS via SCP
-        uses: appleboy/scp-action@master
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}
@@ -72,7 +72,7 @@ jobs:
 
       # Paso 2: Ejecutar comandos de despliegue en el VPS
       - name: Execute deployment commands on VPS
-        uses: appleboy/ssh-action@master
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
           host: ${{ secrets.SSH_HOST }}
           username: ${{ secrets.SSH_USER }}

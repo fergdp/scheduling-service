@@ -1,0 +1,10 @@
+# Mantiene al día las actions de los workflows. Las de appleboy van fijadas por
+# SHA (reciben la clave SSH de producción): Dependabot propone el SHA nuevo y
+# actualiza el comentario con la versión (#472).
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
