@@ -24,7 +24,7 @@ jobs:
 
       # Run tests before deploying — blocks deploy if any test fails
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
 
