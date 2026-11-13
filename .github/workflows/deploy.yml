@@ -53,11 +53,15 @@ jobs:
           echo "Latest version: $VERSION"
 
       # Paso: Crear artefacto de despliegue (ZIP)
-      # Excluimos .env, venv, pycache y otros archivos que no deben ir a producción
+      # Excluimos .env, venv, pycache y otros archivos que no deben ir a producción.
+      # `*/__pycache__/*` no cubre el de la raíz, y los tests corren en este mismo checkout:
+      # sin las exclusiones de abajo viajaban al VPS el __pycache__ raíz, .pytest_cache y
+      # .coverage (#391). .coveragerc, pytest.ini y requirements-dev.txt son sólo de
+      # desarrollo: deploy.sh instala requirements.txt.
       - name: Create deployment artifact
         id: create_artifact
         run: |
-          zip -r scheduling-service.zip . -x "*.env*" -x "venv/*" -x "*/__pycache__/*" -x ".git/*" -x ".github/*" -x "tests/*"
+          zip -r scheduling-service.zip . -x "*.env*" -x "venv/*" -x "*/__pycache__/*" -x "__pycache__/*" -x ".pytest_cache/*" -x ".coverage" -x ".coveragerc" -x "pytest.ini" -x "requirements-dev.txt" -x ".git/*" -x ".github/*" -x "tests/*"
           echo "artifact_path=scheduling-service.zip" >> $GITHUB_OUTPUT
 
       # Paso 1: Copiar el artefacto al VPS usando SCP
