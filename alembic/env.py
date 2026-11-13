@@ -21,8 +21,10 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Set sqlalchemy.url from .env
-database_url = os.getenv("DATABASE_URL")
+# #384: las migraciones corren con un usuario aparte, con permisos de estructura (CREATE,
+# ALTER, DROP) sobre la base. El de la app (DATABASE_URL) sólo lee y escribe datos.
+# Sin MIGRATION_DATABASE_URL se usa DATABASE_URL, como antes.
+database_url = os.getenv("MIGRATION_DATABASE_URL") or os.getenv("DATABASE_URL")
 if database_url:
     config.set_main_option("sqlalchemy.url", database_url.replace('%', '%%'))
 
