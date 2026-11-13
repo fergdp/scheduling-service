@@ -16,7 +16,7 @@ verdad, firmado con la misma clave que usa el servicio.
 """
 from datetime import datetime, timedelta, timezone
 
-from jose import jwt
+import jwt
 from starlette.requests import Request
 
 import dependencies

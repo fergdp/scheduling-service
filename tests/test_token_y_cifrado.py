@@ -14,7 +14,7 @@ import os
 
 import pytest
 from datetime import datetime, timedelta, timezone
-from jose import jwt
+import jwt
 
 
 def _token(payload=None, clave=None, algoritmo="HS256"):

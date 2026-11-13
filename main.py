@@ -10,7 +10,8 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
-from jose import jwt, JWTError
+import jwt
+from jwt import InvalidTokenError
 from dotenv import load_dotenv
 from prometheus_fastapi_instrumentator import Instrumentator
 from pythonjsonlogger import jsonlogger
@@ -178,7 +179,7 @@ async def log_requests(request: Request, call_next):
             # identificar a la persona en el log (#307, misma fuga que el #137 en dental-clinic).
             user_id = payload.get("user_id", "unknown")
             clinic_id = payload.get("clinic_id", "N/A")
-        except JWTError as e:
+        except InvalidTokenError as e:
             logging.warning(f"Middleware JWT processing error: {e}")
             user_id = "invalid_token"
 
@@ -208,7 +209,7 @@ async def exception_handler(request: Request, exc: Exception):
             # Mismo criterio que log_requests: user_id numérico, no `sub` (#307).
             user_id = payload.get("user_id", "unknown")
             clinic_id = payload.get("clinic_id", "N/A")
-        except JWTError:
+        except InvalidTokenError:
             user_id = "invalid_token"
 
     logging.exception(f"Unhandled exception for request: {request.method} {request.url.path} from user: {user_id} (clinic: {clinic_id})", exc_info=exc)

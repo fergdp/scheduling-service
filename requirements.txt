@@ -11,9 +11,13 @@ uvicorn==0.30.6
 gunicorn==23.0.0
 sqlalchemy==2.0.35
 pymysql==1.1.1
-cryptography==43.0.1
-python-jose[cryptography]==3.3.0
-python-dotenv==1.0.1
+cryptography==50.0.2
+# PyJWT en vez de python-jose (#475, 2026-11-12, como quoting y health-insurance): jose
+# arrastra ecdsa (PYSEC-2026-1325) y tiene PYSEC-2026-4298, los dos sin versión corregida.
+# Este servicio sólo firma/verifica HS256 con un secreto simétrico y el algoritmo fijo
+# (sesión y `state` de OAuth). Tokens 100% compatibles. `JWTError` -> `InvalidTokenError`.
+PyJWT==2.15.1
+python-dotenv==1.2.2
 pydantic==2.9.2
 pydantic-settings==2.5.2
 google-api-python-client==2.146.0

@@ -5,7 +5,8 @@ import threading
 from fastapi import Header, HTTPException, Depends, Cookie, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
-from jose import jwt, JWTError
+import jwt
+from jwt import InvalidTokenError
 from slowapi.util import get_remote_address
 from sqlalchemy import create_engine, text, bindparam
 from sqlalchemy.orm import sessionmaker, Session
@@ -98,7 +99,7 @@ def _payload_de(token: Optional[str]) -> Optional[dict]:
         return None
     try:
         return jwt.decode(token, SECRET_KEY_BYTES, algorithms=[ALGORITHM])
-    except JWTError:
+    except InvalidTokenError:
         return None
 
 

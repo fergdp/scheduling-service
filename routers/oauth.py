@@ -7,7 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response, Cookie
 from fastapi.responses import HTMLResponse
 from sqlalchemy.orm import Session
 from typing import Optional
-from jose import jwt, JWTError
+import jwt
+from jwt import InvalidTokenError
 from dependencies import get_db, get_clinic_id, get_user_id, require_any_role
 from utils.google_calendar import get_google_auth_url, exchange_code_for_tokens, get_google_user_email
 from utils.crypto import encrypt_token
@@ -58,7 +59,7 @@ def _decode_state_jwt(state: str) -> dict:
     """Valida firma y expiración del state JWT. Lanza HTTPException si es inválido."""
     try:
         return jwt.decode(state, _SECRET_BYTES, algorithms=[_ALGORITHM])
-    except JWTError as e:
+    except InvalidTokenError as e:
         logger.warning(f"Invalid OAuth state JWT: {e}")
         raise HTTPException(status_code=400, detail="Invalid OAuth state — possible CSRF attack")
 

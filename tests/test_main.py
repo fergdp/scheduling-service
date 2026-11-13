@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from jose import jwt
+import jwt
 from unittest.mock import patch, MagicMock
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
