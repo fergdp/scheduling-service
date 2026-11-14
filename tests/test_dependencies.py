@@ -17,7 +17,7 @@ def _patch_db_returning(clinic_id):
     if clinic_id is None:
         fake_session.execute.return_value.first.return_value = None
     else:
-        fake_session.execute.return_value.first.return_value = (clinic_id,)
+        fake_session.execute.return_value.first.return_value = (clinic_id, b"\x01", None)
     return patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session)
 
 
@@ -118,7 +118,7 @@ def test_get_clinic_id_rejects_token_without_user_id():
 
 def test_db_lookup_is_cached_within_ttl():
     fake_session = MagicMock()
-    fake_session.execute.return_value.first.return_value = (1,)
+    fake_session.execute.return_value.first.return_value = (1, b"\x01", None)
     with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_session):
         get_clinic_id({"user_id": 99, "clinic_id": 1})
         get_clinic_id({"user_id": 99, "clinic_id": 1})
@@ -132,7 +132,7 @@ def test_resolve_db_clinic_id_uses_clinic_db_not_scheduling_db():
     SessionLocal acá, scheduling tira 1146 "Table users doesn't exist" en prod.
     """
     fake_clinic_session = MagicMock()
-    fake_clinic_session.execute.return_value.first.return_value = (7,)
+    fake_clinic_session.execute.return_value.first.return_value = (7, b"\x01", None)
     fake_scheduling_session = MagicMock()
 
     with patch.object(dependencies, "ClinicSessionLocal", return_value=fake_clinic_session), \

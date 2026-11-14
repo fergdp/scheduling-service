@@ -17,6 +17,14 @@ from datetime import datetime, timedelta, timezone
 import jwt
 
 
+@pytest.fixture(autouse=True)
+def cuenta_habilitada(monkeypatch):
+    """Estos tests miden sólo el JWT: la cuenta del token se da por habilitada (#547).
+    El corte por cuenta está en test_cuenta_activa.py."""
+    import dependencies
+    monkeypatch.setattr(dependencies, "_la_sesion_sigue_valida", lambda payload: True)
+
+
 def _token(payload=None, clave=None, algoritmo="HS256"):
     """Firma un JWT con la misma clave y algoritmo que usa el servicio."""
     from dependencies import ALGORITHM, SECRET_KEY_BYTES

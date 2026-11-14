@@ -2,6 +2,7 @@ import logging
 import base64
 import os
 import threading
+from collections import namedtuple
 from fastapi import Header, HTTPException, Depends, Cookie, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from typing import Optional
@@ -9,6 +10,7 @@ import jwt
 from jwt import InvalidTokenError
 from slowapi.util import get_remote_address
 from sqlalchemy import create_engine, text, bindparam
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker, Session
 from cachetools import TTLCache
 from contextvars import ContextVar
@@ -105,10 +107,19 @@ def _payload_de(token: Optional[str]) -> Optional[dict]:
 
 def get_current_user(
     token_cookie: Optional[str] = Cookie(None, alias="token"),
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme)
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
 ) -> Optional[dict]:
+    """
+    El payload del JWT, o `None` si no hay sesion: sin token, token invalido o vencido, o una
+    cuenta que ya no puede entrar (#547). Todos los guards de este servicio pasan por aca y
+    convierten el `None` en 401, incluidos los endpoints que solo piden `get_user_id`. Si la
+    base de dental-clinic no responde, 503.
+    """
     token = token_cookie or (credentials.credentials if credentials else None)
-    return _payload_de(token)
+    payload = _payload_de(token)
+    if payload is None or not _la_sesion_sigue_valida(payload):
+        return None
+    return payload
 
 
 def key_por_usuario_o_ip(request: Request) -> str:
@@ -138,14 +149,32 @@ def key_por_usuario_o_ip(request: Request) -> str:
     return f"user:{user_id}" if user_id is not None else get_remote_address(request)
 
 
-# Defense-in-depth (#82 H1): cache user_id -> clinic_id de DB con TTL 60s para
-# detectar JWT con clinic_id manipulado sin pegarle a DB en cada request.
+# --- La fila de `users` que decide la sesion (#547) y la clinica (#82 H1) ------
+# Una sola consulta por usuario, cacheada, contesta dos preguntas: si la cuenta puede seguir
+# adentro y cual es su clinica. El #330 (la huella de la contrasena) va a sumar su columna a
+# esta misma fila y su comparacion a `_la_sesion_sigue_valida`.
+#
+# En el cache hay una `FilaDeUsuario` o `_NO_EXISTE` (el usuario no esta en la base: se
+# cachea igual). `_MISSING` es otra cosa: marca "no esta en el cache".
+#
+# TTL 60 s (#547). Es lo que tarda, como mucho, en cortarse la sesion
+# de una cuenta deshabilitada o dada de baja, y en volver la de una reactivada. dental-clinic
+# no cachea (#130), pero es el que emite el token y el front saca al usuario con el primer 401
+# de dental-clinic: esta ventana solo la aprovecha quien le pegue directo a la API con la
+# cookie. Mas corto cuesta una consulta por pedido, mas largo es la ventana del #547.
+#
+# ⚠️ Las columnas de este SELECT tienen que estar en el GRANT por columna del usuario de MySQL
+# de este servicio (`COLUMNAS_USERS` en vps-hostinger/usuarios-mysql-384/usuarios_384.py). Si
+# falta una, la consulta falla y NADIE entra: el GRANT va en el VPS antes que el deploy.
 _MISSING = object()
+_NO_EXISTE = object()
+FilaDeUsuario = namedtuple("FilaDeUsuario", ["clinic_id", "is_enabled", "deactivated_at"])
 _user_clinic_cache: TTLCache = TTLCache(maxsize=10000, ttl=60)
 _user_clinic_cache_lock = threading.Lock()
 
 
-def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
+def _fila_de_usuario(user_id: int):
+    """La fila del usuario en la base (`FilaDeUsuario`) o `_NO_EXISTE`."""
     with _user_clinic_cache_lock:
         cached = _user_clinic_cache.get(user_id, _MISSING)
     if cached is not _MISSING:
@@ -155,16 +184,83 @@ def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
     db = ClinicSessionLocal()
     try:
         row = db.execute(
-            text("SELECT clinic_id FROM users WHERE user_id = :uid"),
+            text("SELECT clinic_id, is_enabled, deactivated_at FROM users WHERE user_id = :uid"),
             {"uid": user_id},
         ).first()
+    except SQLAlchemyError:
+        # Falla cerrada, pero que se entienda: sin esto es un 500 genérico en TODOS los
+        # endpoints con sesion. Tambien es lo que se ve si falta el GRANT de una columna.
+        logger.error(
+            "No se pudo leer users de dental-clinic para validar la sesion (#547): "
+            "¿base caida o falta el GRANT de una columna?",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=503, detail="Servicio no disponible")
     finally:
         db.close()
 
-    db_clinic_id = row[0] if row else None
+    fila = _NO_EXISTE if row is None else FilaDeUsuario(row[0], row[1], row[2])
     with _user_clinic_cache_lock:
-        _user_clinic_cache[user_id] = db_clinic_id
-    return db_clinic_id
+        _user_clinic_cache[user_id] = fila
+    return fila
+
+
+def _resolve_db_clinic_id(user_id: int) -> Optional[int]:
+    """La clinica del usuario segun la base, o `None` si no tiene o si no existe (la regla vieja, #284)."""
+    fila = _fila_de_usuario(user_id)
+    return None if fila is _NO_EXISTE else fila.clinic_id
+
+
+def _bit_verdadero(valor) -> bool:
+    """
+    `users.is_enabled` es BIT(1) en MySQL y pymysql lo devuelve como bytes: `b'\\x00'` es
+    VERDADERO en Python, asi que un `if fila.is_enabled` dejaria entrar a todos. Vacio
+    (`NULL`) no entra.
+    """
+    if valor is None:
+        return False
+    if isinstance(valor, (bytes, bytearray)):
+        return int.from_bytes(valor, "big") != 0
+    return bool(valor)
+
+
+def puede_entrar(fila: FilaDeUsuario) -> bool:
+    """
+    Si la cuenta puede seguir adentro: habilitada y sin la marca de baja. Es la regla de
+    dental-clinic (`CustomUserDetails`) y de clinical-history y onboarding
+    (`CustomUserDetailsService.puedeEntrar`, #415): si cambia, cambia en todos.
+
+    Valen las dos columnas: un dado de baja puede quedar con `is_enabled = 1` (#485). Al
+    paciente que espera aprobacion (`is_enabled = 0`) esto no le corta de mas, porque
+    dental-clinic no le da token. ⚠️ En las listas, «dado de baja» es solo `deactivated_at`:
+    no usar esta funcion para filtrar pacientes.
+    """
+    return _bit_verdadero(fila.is_enabled) and fila.deactivated_at is None
+
+
+def _la_sesion_sigue_valida(payload: dict) -> bool:
+    """
+    Si el usuario del token todavia puede usar este servicio (#547). Falla cerrada: un token
+    sin `user_id` o de un usuario que ya no esta en la base tampoco pasa.
+    """
+    user_id = payload.get("user_id")
+    if not user_id:
+        logger.error("Token sin user_id — sin sesion")
+        return False
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        logger.error("Token con un user_id que no es un numero — sin sesion")
+        return False
+    fila = _fila_de_usuario(uid)
+    if fila is _NO_EXISTE:
+        logger.warning(f"user_id={user_id} no existe en la base — sin sesion")
+        return False
+    if not puede_entrar(fila):
+        logger.warning(f"user_id={user_id} deshabilitado o dado de baja — sin sesion (#547)")
+        return False
+    # #330: aca se suma comparar la huella de la contrasena del token con la de `fila`.
+    return True
 
 
 def telefonos_vigentes_de(patient_user_ids) -> dict:
@@ -281,13 +377,24 @@ def get_roles(payload: Optional[dict] = Depends(get_current_user)) -> list[str]:
 
 def require_any_role(*allowed_roles: str):
     """
-    Factory de dependencia: lanza 403 si el usuario no tiene ninguno de los roles requeridos.
+    Factory de dependencia: 401 si no hay sesion (#547) y 403 si el usuario no tiene ninguno de
+    los roles requeridos.
 
     Uso:
         @router.get("/url", dependencies=[require_any_role("DENTIST", "ADMIN")])
         async def my_endpoint(...):
     """
-    def _check(roles: list[str] = Depends(get_roles)) -> list[str]:
+    def _check(
+        payload: Optional[dict] = Depends(get_current_user),
+        roles: list[str] = Depends(get_roles),
+    ) -> list[str]:
+        # 401 y no 403 sin sesion (token vencido o cuenta cortada, #547): las rutas que ponen
+        # este guard en `dependencies=[...]` lo corren ANTES que `get_clinic_id`, y solo el
+        # 401 manda al front al login. Mismo `_check` que quoting.
+        if payload is None:
+            raise HTTPException(
+                status_code=401, detail="Unauthorized: Invalid or missing token"
+            )
         normalized = {r.upper() for r in allowed_roles}
         if not any(r in normalized for r in roles):
             raise HTTPException(
