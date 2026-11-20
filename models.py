@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Time, Enum, Text, Boolean, func, ForeignKey, CheckConstraint, Index
+from sqlalchemy import Column, Integer, String, Date, DateTime, Time, Enum, Text, Boolean, func, ForeignKey, CheckConstraint, Index
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.sql.expression import ColumnElement
@@ -314,4 +314,55 @@ class FreedSlot(Base):
     __table_args__ = (
         # La consulta del cartel: los avisos abiertos de la clínica que todavía no empezaron.
         Index("ix_freed_slots_open", "clinic_id", "closed_at", "start_time_utc"),
+    )
+
+
+# «A quién escribirle hoy» (#556). Textos y no `Enum` de MySQL a propósito: sumar un motivo o una
+# acción no obliga a un `ALTER` de la columna. Los valores los valida la API (`schemas_contactos.py`)
+# y un CHECK en la base.
+CONTACTO_MOTIVOS = ("CONTROL", "PRESUPUESTO", "RESENA")
+CONTACTO_ACCIONES = ("ESCRITO", "POSPUESTO", "NO_SUGERIR", "NO_SUGERIR_NADA", "DESHECHO")
+
+
+def _en_lista(columna: str, valores) -> str:
+    return f"{columna} IN ({', '.join(repr(v) for v in valores)})"
+
+
+class ContactMark(Base):
+    """
+    Lo que hizo alguien del consultorio con un aviso de «A quién escribirle hoy» (#556): le escribió,
+    lo pospuso o pidió que no se le sugiera más. También cada pedido de reseña, que es un botón
+    manual (decisión de Fernando, 2026-11-20).
+
+    De sólo agregar: deshacer es otra fila, `DESHECHO`, que apunta con `anula_a_id` a la que anula
+    (una sola vez: UNIQUE). Así queda la historia para medir (#559).
+
+    ⚠️ `patient_user_id` y `marked_by_user_id` guardan usuarios: están clasificadas en
+    `DatosQueSeConservan.NO_FRENAN` de dental-clinic (#375), como trazas que no impiden borrar a
+    nadie, y en su calco (`db-reality.properties`). Una columna nueva con un usuario se clasifica
+    allá también.
+    """
+    __tablename__ = "contact_marks"
+
+    mark_id = Column(Integer, primary_key=True, autoincrement=True)
+    clinic_id = Column(Integer, nullable=False)
+    patient_user_id = Column(Integer, nullable=False)
+    motivo = Column(String(16), nullable=False)
+    # Sólo para PRESUPUESTO: de qué presupuesto (`dental_quoting_db.quote.id`).
+    quote_id = Column(Integer, nullable=True)
+    accion = Column(String(16), nullable=False)
+    # El día de Córdoba en que se marcó: las ventanas («no repetir en 60 días») se cuentan en días.
+    fecha = Column(Date, nullable=False)
+    # Sólo para POSPUESTO: el último día en que no se sugiere.
+    hasta = Column(Date, nullable=True)
+    anula_a_id = Column(Integer, ForeignKey("contact_marks.mark_id"), nullable=True, unique=True)
+    marked_by_user_id = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=_ahora_utc, server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(_en_lista("motivo", CONTACTO_MOTIVOS), name="chk_contact_marks_motivo"),
+        CheckConstraint(_en_lista("accion", CONTACTO_ACCIONES), name="chk_contact_marks_accion"),
+        # El armado del día lee todas las marcas de la clínica; el contador de reseñas, las de unos
+        # pacientes.
+        Index("ix_contact_marks_clinic_patient", "clinic_id", "patient_user_id"),
     )
