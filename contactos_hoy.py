@@ -45,6 +45,8 @@ descripción de una prestación ni los montos de un presupuesto. Si una lectura 
 depende de ella sale vacío y figura en `motivos_con_error`; los demás salen igual.
 """
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import Callable, Optional
@@ -64,7 +66,18 @@ logger = logging.getLogger(__name__)
 
 # El nombre de la base de presupuestos. Vive en el mismo MySQL que la de dental-clinic: la consulta
 # va por la conexión de `clinic_engine` con el nombre completo, como hace dental-clinic en el #375.
-BASE_PRESUPUESTOS = "dental_quoting_db"
+#
+# Sale de `QUOTING_DB_NAME` (#563): el entorno demo tiene sus propias bases, y con el nombre escrito
+# acá la demo leería los presupuestos de producción. Sin la variable vale lo de siempre. Como va
+# adentro del SQL (un nombre de base no se puede pasar como parámetro), sólo acepta letras, dígitos y
+# `_`: cualquier otra cosa frena el arranque en vez de terminar en la consulta.
+def _nombre_de_base(valor: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,64}", valor or ""):
+        raise ValueError(f"QUOTING_DB_NAME no es un nombre de base válido: {valor!r}")
+    return valor
+
+
+BASE_PRESUPUESTOS = _nombre_de_base(os.getenv("QUOTING_DB_NAME", "dental_quoting_db"))
 
 TOPE_DIARIO = 10
 DIAS_CONTROL = 180
