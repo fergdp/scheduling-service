@@ -330,7 +330,14 @@ CAMPOS_PERMITIDOS = {
     schemas_contactos.ContactoParaEscribir: {"es_tutor", "nombre", "telefono"},
     schemas_contactos.MarcaGuardada: {"mark_id", "patient_user_id", "motivo", "accion", "quote_id", "fecha", "hasta"},
     schemas_contactos.MarcasGuardadas: {"marcas"},
-    schemas_contactos.PedidosDeResena: {"veces", "ultima"},
+    schemas_contactos.ResenaDelPaciente: {"veces", "ultima", "numero_whatsapp", "contacto", "mensaje"},
+    schemas_contactos.Resenas: {"link_configurado", "pacientes"},
+    schemas_contactos.ConfigDeContactos: {
+        "link_resena", "textos", "textos_de_fabrica", "marcadores", "dias_control", "tope_diario",
+        "motivos_activos", "puede_editar",
+    },
+    schemas_contactos.TextosDeContactos: {"control", "chicos", "presupuesto", "resena"},
+    schemas_contactos.VistaPrevia: {"mensaje"},
 }
 
 
@@ -578,14 +585,16 @@ def test_cuantas_veces_se_pidio_la_resena(clinica, client, monkeypatch):
     marcar(client, "CONTROL", "ESCRITO", 11)
     r = client.get(f"{URL}/resenas", params={"patient_ids": "10,11,12"})
     assert r.status_code == 200
-    assert r.json() == {"10": {"veces": 2, "ultima": "2027-03-20"}, "11": {"veces": 0, "ultima": None},
-                        "12": {"veces": 0, "ultima": None}}
+    cero = {"veces": 0, "ultima": None, "numero_whatsapp": None, "contacto": None, "mensaje": None}
+    assert r.json() == {"link_configurado": False, "pacientes": {
+        "10": {**cero, "veces": 2, "ultima": "2027-03-20"}, "11": cero, "12": cero}}
 
 
 def test_las_resenas_de_otra_clinica_no_se_ven(clinica, client):
     marca_en_la_base(2, 10, motivo="RESENA")
     r = client.get(f"{URL}/resenas", params={"patient_ids": "10"})
-    assert r.json() == {"10": {"veces": 0, "ultima": None}}
+    assert r.json()["pacientes"] == {"10": {"veces": 0, "ultima": None, "numero_whatsapp": None,
+                                            "contacto": None, "mensaje": None}}
 
 
 def test_una_marca_de_otra_clinica_no_saca_a_nadie_de_la_lista(clinica, client):
@@ -727,7 +736,7 @@ def test_dos_toques_en_pedir_resena_cuentan_uno(clinica, client):
     primera = marcar(client, "RESENA", "ESCRITO", 10)["marcas"][0]
     segunda = marcar(client, "RESENA", "ESCRITO", 10)["marcas"][0]
     assert primera == segunda
-    assert client.get(f"{URL}/resenas", params={"patient_ids": "10"}).json()["10"]["veces"] == 1
+    assert client.get(f"{URL}/resenas", params={"patient_ids": "10"}).json()["pacientes"]["10"]["veces"] == 1
     # Deshecha, el toque siguiente sí anota una nueva.
     client.delete(f"{URL}/marcas/{primera['mark_id']}")
     assert marcar(client, "RESENA", "ESCRITO", 10)["marcas"][0]["mark_id"] != primera["mark_id"]

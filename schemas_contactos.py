@@ -115,6 +115,72 @@ class MarcasGuardadas(BaseModel):
     marcas: list[MarcaGuardada]
 
 
-class PedidosDeResena(BaseModel):
+
+
+# ---------------------------------------------------------------------------
+# Reseñas y configuración (#558)
+# ---------------------------------------------------------------------------
+
+class ResenaDelPaciente(BaseModel):
+    """
+    Lo del botón «Pedir reseña» de un paciente: cuántas veces se pidió y, si la clínica tiene el
+    link configurado, a qué número va y el mensaje ya armado (a quién va lo decide #417).
+    """
     veces: int
     ultima: Optional[date] = None
+    numero_whatsapp: Optional[str] = None
+    contacto: Optional[ContactoParaEscribir] = None
+    mensaje: Optional[str] = None
+
+
+class Resenas(BaseModel):
+    """`link_configurado` en falso: el botón no se ofrece, y quien edita ve dónde cargarlo."""
+    link_configurado: bool
+    pacientes: dict[int, ResenaDelPaciente]
+
+
+class TextosDeContactos(BaseModel):
+    control: Optional[str] = None
+    chicos: Optional[str] = None
+    presupuesto: Optional[str] = None
+    resena: Optional[str] = None
+
+
+class ConfigDeContactos(BaseModel):
+    """
+    La configuración de la clínica. En `textos`, `null` es «el de fábrica», que viene en
+    `textos_de_fabrica` para mostrarlo y arrancar a cambiarlo. `puede_editar`: el admin y el dueño
+    de la clínica (como la configuración de Cobros, #371); el resto la lee.
+    """
+    link_resena: Optional[str] = None
+    textos: TextosDeContactos
+    textos_de_fabrica: TextosDeContactos
+    marcadores: list[str]
+    dias_control: int
+    tope_diario: int
+    motivos_activos: list[Literal["PRESUPUESTO", "CONTROL"]]
+    puede_editar: bool
+
+
+class ConfigPedido(BaseModel):
+    """
+    Lo que se guarda, entero: lo que no viene vuelve a lo de fábrica. Un texto vacío (o sólo
+    espacios) también es «el de fábrica». Las reglas que miran el contenido (marcadores, el link)
+    las aplica el router, para poder decir cuál es el que falla.
+    """
+    link_resena: Optional[str] = Field(default=None, max_length=500)
+    textos: TextosDeContactos = Field(default_factory=TextosDeContactos)
+    dias_control: int = Field(default=180, ge=90, le=730)
+    tope_diario: int = Field(default=10, ge=1, le=30)
+    motivos_activos: list[Literal["PRESUPUESTO", "CONTROL"]] = Field(default_factory=lambda: ["PRESUPUESTO", "CONTROL"])
+
+
+class VistaPreviaPedido(BaseModel):
+    """Un texto (vacío = el de fábrica) armado con un paciente de ejemplo, para la configuración."""
+    cual: Literal["control", "chicos", "presupuesto", "resena"]
+    texto: Optional[str] = Field(default=None, max_length=1000)
+    link_resena: Optional[str] = Field(default=None, max_length=500)
+
+
+class VistaPrevia(BaseModel):
+    mensaje: str

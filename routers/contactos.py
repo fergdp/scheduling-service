@@ -13,12 +13,14 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+import contactos_config
 import contactos_hoy
-from dependencies import get_clinic_id, get_db, get_user_id, require_any_role
+from dependencies import get_clinic_id, get_db, get_roles, get_user_id, require_any_role
 from models import ContactMark
 from schemas_contactos import (
-    Aviso, AvisosDelDia, MarcaGuardada, MarcaPedido, MarcasGuardadas, PacienteDelAviso,
-    PedidosDeResena, SinTelefono,
+    Aviso, AvisosDelDia, ConfigDeContactos, ConfigPedido, MarcaGuardada, MarcaPedido, MarcasGuardadas,
+    PacienteDelAviso, ResenaDelPaciente, Resenas, SinTelefono, TextosDeContactos, VistaPrevia,
+    VistaPreviaPedido,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +49,8 @@ def avisos_de_hoy(
     Los avisos del día de la clínica. Con `dentist_id`, sólo los de sus pacientes: los de su última
     atención (control) o los de sus presupuestos.
     """
-    dia = contactos_hoy.armar_el_dia(db, clinic_id, dentist_id=dentist_id)
+    cfg = contactos_config.leer(db, clinic_id)
+    dia = contactos_hoy.armar_el_dia(db, clinic_id, dentist_id=dentist_id, cfg=cfg)
     avisos = []
     for a in dia.avisos:
         primero = a.pacientes[0][0]
@@ -80,8 +83,8 @@ def avisos_de_hoy(
             presupuesto_vencido=vencido,
             profesional_user_id=a.profesional_user_id,
             profesional=profesional,
-            mensaje=contactos_hoy.mensaje(
-                a.motivo, a.contacto["nombre"], es_tutor, nombres, profesional, dia.clinica,
+            mensaje=contactos_hoy.armar_mensaje(
+                cfg, a.motivo, a.contacto["nombre"], es_tutor, nombres, profesional, dia.clinica,
                 meses=dias // 30,
                 fecha_presupuesto=presupuesto.fecha_emision if presupuesto else None,
                 presupuesto_vencido=vencido,
@@ -95,7 +98,7 @@ def avisos_de_hoy(
     )
     return AvisosDelDia(
         hoy=dia.hoy,
-        tope=contactos_hoy.TOPE_DIARIO,
+        tope=cfg.tope_diario,
         avisos=avisos,
         sin_telefono=[
             SinTelefono(patient_user_id=c.patient_user_id, nombre=nombre, motivo=c.motivo)
@@ -202,16 +205,21 @@ def deshacer(
     return Response(status_code=204)
 
 
-@router.get("/resenas", response_model=dict[int, PedidosDeResena])
+@router.get("/resenas", response_model=Resenas)
 def pedidos_de_resena(
     patient_ids: str = Query(..., description="Ids separados por coma"),
     clinic_id: int = Depends(get_clinic_id),
     db: Session = Depends(get_db),
 ):
     """
-    Cuántas veces se le pidió la reseña a cada paciente y cuándo fue la última, para el botón de la
-    ficha y de la agenda: una consulta para toda la página, no una por fila. Sólo cuenta las marcas
-    de la clínica; un id sin pedidos (o de otra clínica) sale con 0.
+    Lo del botón «Pedir reseña» de cada paciente (#558), en un pedido para toda la página: cuántas
+    veces se le pidió y cuándo fue la última, y —si la clínica tiene el link de reseña— a qué
+    número va y el mensaje ya armado. El mensaje viene acá y no al tocar el botón porque abrir
+    WhatsApp después de esperar una respuesta lo frena el bloqueador de ventanas del navegador.
+
+    Sólo cuenta las marcas de la clínica; un id sin pedidos sale con 0, y uno de otra clínica (o
+    dado de baja) sale sin mensaje. Si los pacientes no se pueden leer, salen los contadores sin
+    mensaje: el botón no se ofrece, y nada más se rompe.
     """
     try:
         ids = sorted({int(x) for x in patient_ids.split(",") if x.strip()})
@@ -219,7 +227,7 @@ def pedidos_de_resena(
         raise HTTPException(status_code=422, detail="patient_ids: ids separados por coma")
     if not ids or len(ids) > MAX_PACIENTES_RESENAS or min(ids) <= 0:
         raise HTTPException(status_code=422, detail=f"patient_ids: de 1 a {MAX_PACIENTES_RESENAS} ids")
-    resultado = {i: PedidosDeResena(veces=0) for i in ids}
+    resultado = {i: ResenaDelPaciente(veces=0) for i in ids}
     for m in contactos_hoy.leer_marcas(db, clinic_id, ids):
         if m.motivo != "RESENA" or m.accion != "ESCRITO":
             continue
@@ -227,4 +235,144 @@ def pedidos_de_resena(
         r.veces += 1
         if r.ultima is None or m.fecha > r.ultima:
             r.ultima = m.fecha
-    return resultado
+    cfg = contactos_config.leer(db, clinic_id)
+    try:
+        armados = contactos_hoy.mensajes_de_resena(db, clinic_id, ids, cfg)
+    except contactos_hoy._LecturaFallida:
+        armados = {}
+    for paciente_id, armado in armados.items():
+        r = resultado[paciente_id]
+        r.numero_whatsapp = armado.numero
+        r.contacto = armado.contacto
+        r.mensaje = armado.mensaje
+    return Resenas(link_configurado=bool(cfg.link_resena), pacientes=resultado)
+
+
+# ---------------------------------------------------------------------------
+# Configuración (#558)
+# ---------------------------------------------------------------------------
+
+def _puede_editar(clinic_id: int, user_id: int, roles: list) -> bool:
+    """El admin y el dueño de la clínica, como la configuración de Cobros (#371). Si no se puede
+    preguntar quién es el dueño, nadie más que el admin."""
+    if "ADMIN" in roles:
+        return True
+    try:
+        return contactos_hoy.duenio_de_la_clinica(clinic_id) == user_id
+    except contactos_hoy._LecturaFallida:
+        return False
+
+
+def _config_respuesta(cfg: "contactos_config.Config", puede_editar: bool) -> ConfigDeContactos:
+    return ConfigDeContactos(
+        link_resena=cfg.link_resena,
+        textos=TextosDeContactos(**cfg.textos),
+        textos_de_fabrica=TextosDeContactos(**contactos_config.DE_FABRICA),
+        marcadores=list(contactos_config.MARCADORES),
+        dias_control=cfg.dias_control,
+        tope_diario=cfg.tope_diario,
+        motivos_activos=list(cfg.motivos_activos),
+        puede_editar=puede_editar,
+    )
+
+
+def _texto_valido(nombre: str, texto: Optional[str]) -> Optional[str]:
+    """`None` si está vacío (vuelve a lo de fábrica); 422 si trae un marcador que no existe."""
+    texto = (texto or "").strip()
+    if not texto:
+        return None
+    if len(texto) > contactos_config.LARGO_MAXIMO_TEXTO:
+        raise HTTPException(status_code=422, detail=f"El texto de {nombre} pasa de {contactos_config.LARGO_MAXIMO_TEXTO} caracteres")
+    desconocidos = contactos_config.marcadores_desconocidos(texto)
+    if desconocidos:
+        raise HTTPException(
+            status_code=422,
+            detail=f"El texto de {nombre} tiene un marcador que no existe: "
+                   + ", ".join("{" + d + "}" for d in desconocidos)
+                   + ". Los que sí: " + ", ".join("{" + m + "}" for m in contactos_config.MARCADORES),
+        )
+    return texto
+
+
+def _link_valido(link: Optional[str]) -> Optional[str]:
+    link = (link or "").strip()
+    if not link:
+        return None
+    if not contactos_config.link_valido(link):
+        raise HTTPException(status_code=422, detail="El link de reseña tiene que empezar con https://")
+    return link
+
+
+@router.get("/config", response_model=ConfigDeContactos)
+def ver_config(
+    clinic_id: int = Depends(get_clinic_id),
+    user_id: int = Depends(get_user_id),
+    roles: list = Depends(get_roles),
+    db: Session = Depends(get_db),
+):
+    """La configuración de la clínica. La leen todos los que entran; `puede_editar` dice quién la cambia."""
+    return _config_respuesta(contactos_config.leer(db, clinic_id), _puede_editar(clinic_id, user_id, roles))
+
+
+@router.put("/config", response_model=ConfigDeContactos)
+def guardar_config(
+    pedido: ConfigPedido,
+    clinic_id: int = Depends(get_clinic_id),
+    user_id: int = Depends(get_user_id),
+    roles: list = Depends(get_roles),
+    db: Session = Depends(get_db),
+):
+    """Guarda la configuración entera. Sólo el admin y el dueño de la clínica (403 al resto)."""
+    if not _puede_editar(clinic_id, user_id, roles):
+        raise HTTPException(status_code=403, detail="La configuración de los mensajes la cambia el dueño de la clínica")
+    textos = {}
+    for nombre in contactos_config.TEXTOS:
+        valor = _texto_valido(nombre, getattr(pedido.textos, nombre))
+        if valor and not contactos_config.es_el_de_fabrica(nombre, valor):
+            textos[nombre] = valor
+    cfg = contactos_config.Config(
+        link_resena=_link_valido(pedido.link_resena),
+        textos=textos,
+        dias_control=pedido.dias_control,
+        tope_diario=pedido.tope_diario,
+        motivos_activos=tuple(m for m in contactos_config.MOTIVOS_DEL_PANEL if m in pedido.motivos_activos),
+    )
+    contactos_config.guardar(db, clinic_id, cfg)
+    logger.info("contactos_hoy config clinic_id=%s user_id=%s textos_propios=%s link=%s",
+                clinic_id, user_id, ",".join(sorted(textos)), bool(cfg.link_resena))
+    return _config_respuesta(contactos_config.leer(db, clinic_id), True)
+
+
+# El paciente de ejemplo de la vista previa: nombres que no son de nadie.
+_EJEMPLO = {
+    "control": dict(motivo="CONTROL", contacto_nombre="Juan Pérez", es_tutor=False, pacientes=["Juan"]),
+    "chicos": dict(motivo="CONTROL", contacto_nombre="Laura Gómez", es_tutor=True, pacientes=["Tomás", "Sofía"]),
+    "presupuesto": dict(motivo="PRESUPUESTO", contacto_nombre="Carlos Díaz", es_tutor=False, pacientes=["Carlos"]),
+    "resena": dict(motivo="RESENA", contacto_nombre="María López", es_tutor=False, pacientes=["María"]),
+}
+
+
+@router.post("/config/vista-previa", response_model=VistaPrevia)
+def vista_previa(
+    pedido: VistaPreviaPedido,
+    clinic_id: int = Depends(get_clinic_id),
+    user_id: int = Depends(get_user_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Cómo queda un texto (vacío = el de fábrica) con un paciente de ejemplo, armado igual que en el
+    panel. No guarda nada. El profesional es quien pregunta, si es odontólogo de la clínica.
+    """
+    texto = _texto_valido(pedido.cual, pedido.texto)
+    guardada = contactos_config.leer(db, clinic_id)
+    cfg = contactos_config.Config(
+        link_resena=_link_valido(pedido.link_resena) or guardada.link_resena or "https://g.page/r/tu-clinica/review",
+        textos={pedido.cual: texto} if texto and not contactos_config.es_el_de_fabrica(pedido.cual, texto) else {},
+    )
+    ejemplo = _EJEMPLO[pedido.cual]
+    profesional = contactos_hoy.contacto.nombres_de({user_id}, clinic_id).get(user_id)
+    return VistaPrevia(mensaje=contactos_hoy.armar_mensaje(
+        cfg, ejemplo["motivo"], ejemplo["contacto_nombre"], ejemplo["es_tutor"], ejemplo["pacientes"],
+        profesional, contactos_hoy.leer_nombre_clinica(clinic_id), meses=7,
+        fecha_presupuesto=contactos_hoy.hoy_en_cordoba() - timedelta(days=12),
+    ))

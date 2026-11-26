@@ -54,6 +54,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 import contacto
+import contactos_config
 import dependencies
 from horario_atencion import HUSO_CLINICA
 from models import Appointment, AppointmentStatus, ContactMark
@@ -161,7 +162,7 @@ def _consulta(sql: str, params: dict, que: str):
         db.close()
 
 
-def leer_ultimas_prestaciones(clinic_id: int, hoy: date) -> dict:
+def leer_ultimas_prestaciones(clinic_id: int, hoy: date, ids=None) -> dict:
     """
     De cada paciente de la clínica, su prestación más nueva: `{paciente: (fecha, profesional)}`.
     De dos del mismo día, la cargada después. Sólo columnas que no dicen nada clínico.
@@ -169,11 +170,16 @@ def leer_ultimas_prestaciones(clinic_id: int, hoy: date) -> dict:
     Sólo las de los últimos tres años (más atrás nadie entra a Control) y ninguna con fecha futura:
     un error de tipeo no esconde al paciente.
     """
+    params = {"c": clinic_id, "desde": hoy - timedelta(days=DIAS_CONTROL_MAXIMO), "hoy": hoy}
+    de_quienes = ""
+    if ids is not None:
+        params["ids"] = sorted(ids)
+        de_quienes = " AND h.patient_user_id IN :ids"
     filas = _consulta(
         "SELECT h.patient_user_id, tp.procedure_date, tp.professional_id, tp.procedure_id "
         "FROM clinical_histories h JOIN treatment_procedures tp ON tp.history_id = h.history_id "
-        "WHERE h.clinic_id = :c AND tp.procedure_date BETWEEN :desde AND :hoy",
-        {"c": clinic_id, "desde": hoy - timedelta(days=DIAS_CONTROL_MAXIMO), "hoy": hoy}, "las prestaciones",
+        "WHERE h.clinic_id = :c AND tp.procedure_date BETWEEN :desde AND :hoy" + de_quienes,
+        params, "las prestaciones",
     )
     mejores: dict = {}
     for paciente, fecha, profesional, procedure_id in filas:
@@ -246,6 +252,13 @@ def leer_pacientes(ids, clinic_id: int) -> dict:
         fila[0]: Paciente(contacto._nombre(fila[1], fila[2]), contacto._texto(fila[3]), fila[4] is not None)
         for fila in filas
     }
+
+
+def duenio_de_la_clinica(clinic_id: int) -> Optional[int]:
+    """`clinics.owner_user_id`. Si no se puede leer, sube `_LecturaFallida`: nadie edita por no haber
+    podido preguntar (como `cobros.duenio_de_la_clinica` de quoting)."""
+    filas = _consulta("SELECT owner_user_id FROM clinics WHERE clinic_id = :c", {"c": clinic_id}, "el dueño de la clínica")
+    return filas[0][0] if filas else None
 
 
 def leer_nombre_clinica(clinic_id: int) -> Optional[str]:
@@ -451,6 +464,7 @@ def mensaje(
     meses: int = 0,
     fecha_presupuesto: Optional[date] = None,
     presupuesto_vencido: bool = False,
+    link_resena: Optional[str] = None,
 ) -> str:
     """
     El texto por defecto (los de cada clínica vienen con el #558). Voseo, «turno» y nunca «cita»,
@@ -469,6 +483,11 @@ def mensaje(
     inicio = f"{saludo}, ¿cómo estás?{f' {presentacion}' if presentacion else ''}"
     chicos = _enumerar(pacientes) if es_tutor else ""
     varios = es_tutor and len([p for p in pacientes if p]) > 1
+
+    if motivo == "RESENA":
+        gracias = f"Gracias por traer a {chicos}." if es_tutor and chicos else "Gracias por venir."
+        return (f"{inicio} {gracias} Si te quedaste conforme con la atención, nos ayudaría mucho que nos "
+                f"dejes una reseña en Google: {link_resena or ''}").rstrip()
 
     if motivo == "PRESUPUESTO":
         if es_tutor:
@@ -490,6 +509,42 @@ def mensaje(
                 f"¿Querés que {'les' if varios else 'le'} reservemos un turno?")
     return (f"{inicio} {tiempo}tu última consulta: es un buen momento para un control. "
             f"¿Querés que te reservemos un turno?")
+
+
+def clave_del_texto(motivo: str, es_tutor: bool) -> str:
+    """Qué texto de la configuración usa un mensaje: el control a un tutor es el de «chicos»."""
+    if motivo == "CONTROL":
+        return "chicos" if es_tutor else "control"
+    return motivo.lower()
+
+
+def armar_mensaje(
+    cfg: "contactos_config.Config",
+    motivo: str,
+    contacto_nombre: Optional[str],
+    es_tutor: bool,
+    pacientes: list,
+    profesional: Optional[str],
+    clinica: Optional[str],
+    meses: int = 0,
+    fecha_presupuesto: Optional[date] = None,
+    presupuesto_vencido: bool = False,
+) -> str:
+    """El texto propio de la clínica con sus marcadores, o el de fábrica si no lo cambió (#558)."""
+    propio = cfg.textos.get(clave_del_texto(motivo, es_tutor))
+    if not propio:
+        return mensaje(motivo, contacto_nombre, es_tutor, pacientes, profesional, clinica, meses=meses,
+                       fecha_presupuesto=fecha_presupuesto, presupuesto_vencido=presupuesto_vencido,
+                       link_resena=cfg.link_resena)
+    return contactos_config.completar(propio, {
+        "nombre": primer_nombre(contacto_nombre),
+        "pacientes": _enumerar([p for p in pacientes if p]),
+        "meses": meses or "",
+        "fecha": _ddmm(fecha_presupuesto) if fecha_presupuesto else "",
+        "clinica": (clinica or "").strip().rstrip("."),
+        "profesional": (profesional or "").strip(),
+        "link_resena": cfg.link_resena or "",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -589,8 +644,10 @@ def armar_el_dia(
     dentist_id: Optional[int] = None,
     datos_de_contacto: Callable = contacto.datos_de_contacto,
     nombres_de: Callable = contacto.nombres_de,
+    cfg: Optional["contactos_config.Config"] = None,
 ) -> ResultadoDelDia:
     hoy = hoy or hoy_en_cordoba()
+    cfg = cfg or contactos_config.Config()
     errores: list = []
 
     try:
@@ -609,8 +666,11 @@ def armar_el_dia(
 
     futuros, atendidos = leer_turnos(db, clinic_id)
     marcas = leer_marcas(db, clinic_id, para_el_dia=hoy)
+    # Un motivo que la clínica apagó no se lee como caído: simplemente no se sugiere.
     lista = candidatos(hoy, ultimas_atenciones(prestaciones, atendidos), presupuestos, ortodoncia,
-                       futuros, marcas, con_presupuestos=con_presupuestos, con_controles=con_controles)
+                       futuros, marcas, dias_control=cfg.dias_control,
+                       con_presupuestos=con_presupuestos and "PRESUPUESTO" in cfg.motivos_activos,
+                       con_controles=con_controles and "CONTROL" in cfg.motivos_activos)
     escritos_hoy = bloqueos(marcas, hoy).escritos_hoy
 
     ids = {c.patient_user_id for c in lista} | {p for p, _ in escritos_hoy}
@@ -634,7 +694,7 @@ def armar_el_dia(
             if motivo != "RESENA":
                 del_panel.add(numero)
     avisos, sin_telefono = armar_avisos(hoy, lista, pacientes, datos,
-                                        tope=max(0, TOPE_DIARIO - len(del_panel)),
+                                        tope=max(0, cfg.tope_diario - len(del_panel)),
                                         numeros_ocupados=frozenset(ocupados))
     if dentist_id is not None:
         avisos = [a for a in avisos if a.profesional_user_id == dentist_id]
@@ -643,3 +703,51 @@ def armar_el_dia(
     profesionales = nombres_de({a.profesional_user_id for a in avisos}, clinic_id)
     return ResultadoDelDia(hoy, avisos, sin_telefono, sorted(set(errores)), profesionales,
                            leer_nombre_clinica(clinic_id))
+
+
+@dataclass
+class ParaResena:
+    numero: Optional[str]
+    # El modelo, no un dict: asignarle un dict al campo de la respuesta hace que Pydantic avise al
+    # serializar con un warning que trae el valor —el teléfono— y va al log (lo vio la revisión).
+    contacto: object
+    mensaje: str
+
+
+def mensajes_de_resena(db: Session, clinic_id: int, ids, cfg: "contactos_config.Config",
+                       hoy: Optional[date] = None,
+                       datos_de_contacto: Callable = contacto.datos_de_contacto,
+                       nombres_de: Callable = contacto.nombres_de) -> dict:
+    """
+    `{paciente: ParaResena}` de los pacientes de la clínica (los de otra no vienen), con el mensaje
+    de reseña armado: a quién va (el tutor si es un chico, #417), el número para `wa.me` (o `None`)
+    y el texto. Sin link de reseña configurado, vacío: el botón no se ofrece.
+
+    `{profesional}` es el de su última prestación de los últimos tres años; si no tiene, el mensaje
+    sale sin el nombre.
+    """
+    if not cfg.link_resena or not ids:
+        return {}
+    hoy = hoy or hoy_en_cordoba()
+    pacientes = leer_pacientes(set(ids), clinic_id)
+    vivos = {i: p for i, p in pacientes.items() if not p.dado_de_baja}
+    if not vivos:
+        return {}
+    datos = datos_de_contacto(list(vivos), clinic_id)
+    try:
+        prestaciones = leer_ultimas_prestaciones(clinic_id, hoy, set(vivos))
+    except _LecturaFallida:
+        prestaciones = {}
+    profesionales = nombres_de({prof for _, prof in prestaciones.values() if prof}, clinic_id)
+    clinica = leer_nombre_clinica(clinic_id)
+    salida = {}
+    for paciente_id, paciente in vivos.items():
+        destino = contacto.contacto_de(paciente_id, paciente.nombre, paciente.telefono, datos)
+        prof = prestaciones.get(paciente_id, (None, None))[1]
+        salida[paciente_id] = ParaResena(
+            numero=numero_para_whatsapp(destino.telefono),
+            contacto=destino,
+            mensaje=armar_mensaje(cfg, "RESENA", destino.nombre, destino.es_tutor, [primer_nombre(paciente.nombre)],
+                                  profesionales.get(prof), clinica),
+        )
+    return salida

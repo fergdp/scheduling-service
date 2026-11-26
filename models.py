@@ -366,3 +366,28 @@ class ContactMark(Base):
         # pacientes.
         Index("ix_contact_marks_clinic_patient", "clinic_id", "patient_user_id"),
     )
+
+
+class ContactSettings(Base):
+    """
+    La configuración de «A quién escribirle hoy» de cada clínica (#558): el link de reseña de
+    Google, los textos de los mensajes, cada cuánto se sugiere el control y el tope del día.
+
+    Una fila por clínica; si no hay fila, o un campo está vacío, vale lo de fábrica
+    (`contactos_config.DE_FABRICA`). Sin columnas de usuario a propósito: no entra en la regla de
+    borrado de dental-clinic (#375).
+    """
+    __tablename__ = "contact_settings"
+
+    clinic_id = Column(Integer, primary_key=True, autoincrement=False)
+    link_resena = Column(String(500), nullable=True)
+    texto_control = Column(Text, nullable=True)
+    texto_chicos = Column(Text, nullable=True)
+    texto_presupuesto = Column(Text, nullable=True)
+    texto_resena = Column(Text, nullable=True)
+    dias_control = Column(Integer, nullable=True)
+    tope_diario = Column(Integer, nullable=True)
+    # Los motivos que el panel sugiere, separados por coma («CONTROL,PRESUPUESTO»). NULL = los dos
+    # (nunca se guardó); vacío = ninguno (se apagaron los dos).
+    motivos_activos = Column(String(64), nullable=True)
+    updated_at = Column(DateTime, default=_ahora_utc, onupdate=_ahora_utc, nullable=False)
