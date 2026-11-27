@@ -6,7 +6,7 @@ Los endpoints son `def` y no `async def`, como en la lista de espera: SQLAlchemy
 consulta lenta adentro de un `async def` frena el worker entero.
 """
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -15,10 +15,12 @@ from sqlalchemy.orm import Session
 
 import contactos_config
 import contactos_hoy
+import contactos_metricas
 from dependencies import get_clinic_id, get_db, get_roles, get_user_id, require_any_role
 from models import ContactMark
 from schemas_contactos import (
     Aviso, AvisosDelDia, ConfigDeContactos, ConfigPedido, MarcaGuardada, MarcaPedido, MarcasGuardadas,
+    MetricaDelMotivo, MetricasDeContactos, SemanaDeMetricas,
     PacienteDelAviso, ResenaDelPaciente, Resenas, SinTelefono, TextosDeContactos, VistaPrevia,
     VistaPreviaPedido,
 )
@@ -376,3 +378,46 @@ def vista_previa(
         profesional, contactos_hoy.leer_nombre_clinica(clinic_id), meses=7,
         fecha_presupuesto=contactos_hoy.hoy_en_cordoba() - timedelta(days=12),
     ))
+
+
+# ---------------------------------------------------------------------------
+# Métricas (#559)
+# ---------------------------------------------------------------------------
+
+@router.get("/metricas", response_model=MetricasDeContactos)
+def metricas(
+    desde: Optional[date] = Query(default=None),
+    hasta: Optional[date] = Query(default=None),
+    clinic_id: int = Depends(get_clinic_id),
+    db: Session = Depends(get_db),
+):
+    """
+    Si el panel sirve: los «le escribí» del período y cuántos volvieron o aceptaron en 30 días (las
+    reglas, en `contactos_metricas.py`). Sin `hasta`, hoy; sin `desde`, 90 días antes de `hasta`.
+    Sólo cuentas: ningún paciente. Los avisos mostrados no están acá: salen del log de `GET /hoy`.
+    """
+    hoy = contactos_hoy.hoy_en_cordoba()
+    hasta = hasta or hoy
+    desde = desde or hasta - timedelta(days=contactos_metricas.PERIODO_DIAS - 1)
+    if desde > hasta or hasta > hoy:
+        raise HTTPException(status_code=422, detail="El período va de `desde` a `hasta`, y `hasta` no puede ser futuro")
+    if (hasta - desde).days >= contactos_metricas.PERIODO_DIAS_MAXIMO:
+        raise HTTPException(status_code=422, detail=f"El período es de {contactos_metricas.PERIODO_DIAS_MAXIMO} días como mucho")
+    r = contactos_metricas.medir(db, clinic_id, desde, hasta, hoy)
+
+    def del_motivo(m: "contactos_metricas.DelMotivo") -> MetricaDelMotivo:
+        return MetricaDelMotivo(escritos=m.escritos, funcionaron=m.funcionaron, en_curso=m.en_curso,
+                                cumplidos=m.cumplidos, funcionaron_cumplidos=m.funcionaron_cumplidos,
+                                pospuestos=m.pospuestos, descartados=m.descartados)
+
+    return MetricasDeContactos(
+        desde=r.desde, hasta=r.hasta, ventana_dias=contactos_metricas.VENTANA_DIAS,
+        control=del_motivo(r.por_motivo["CONTROL"]),
+        presupuesto=del_motivo(r.por_motivo["PRESUPUESTO"]),
+        resena=del_motivo(r.por_motivo["RESENA"]),
+        semanas=[
+            SemanaDeMetricas(lunes=lunes, control=s["CONTROL"], presupuesto=s["PRESUPUESTO"], resena=s["RESENA"])
+            for lunes, s in sorted(r.por_semana.items())
+        ],
+        motivos_con_error=r.motivos_con_error,
+    )

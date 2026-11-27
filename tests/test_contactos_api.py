@@ -94,7 +94,7 @@ def clinica(monkeypatch):
             "patient_user_id INTEGER, estado TEXT, notas TEXT)",
             "CREATE TABLE dental_quoting_db.quote (id INTEGER PRIMARY KEY, clinic_id INTEGER, patient_user_id INTEGER, "
             "dentista_user_id INTEGER, estado TEXT, fecha_emision DATE, fecha_vencimiento DATE, "
-            "version_of_quote_id INTEGER, notas TEXT, total_paciente NUMERIC)",
+            "version_of_quote_id INTEGER, notas TEXT, total_paciente NUMERIC, accepted_at DATETIME)",
         ]:
             cx.execute(text(sentencia))
         for nombre, role_id in ROLES.items():
@@ -338,6 +338,13 @@ CAMPOS_PERMITIDOS = {
     },
     schemas_contactos.TextosDeContactos: {"control", "chicos", "presupuesto", "resena"},
     schemas_contactos.VistaPrevia: {"mensaje"},
+    schemas_contactos.MetricasDeContactos: {
+        "desde", "hasta", "ventana_dias", "control", "presupuesto", "resena", "semanas", "motivos_con_error",
+    },
+    schemas_contactos.MetricaDelMotivo: {
+        "escritos", "funcionaron", "en_curso", "cumplidos", "funcionaron_cumplidos", "pospuestos", "descartados",
+    },
+    schemas_contactos.SemanaDeMetricas: {"lunes", "control", "presupuesto", "resena"},
 }
 
 

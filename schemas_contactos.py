@@ -184,3 +184,43 @@ class VistaPreviaPedido(BaseModel):
 
 class VistaPrevia(BaseModel):
     mensaje: str
+
+
+# ---------------------------------------------------------------------------
+# Métricas (#559): sólo cuentas, ningún paciente.
+# ---------------------------------------------------------------------------
+
+class MetricaDelMotivo(BaseModel):
+    """
+    Las marcas de un motivo en el período. `funcionaron`: volvió (control) o aceptó (presupuesto)
+    dentro de los 30 días; `en_curso`: no todavía, y le quedan días. `cumplidos`: a las que ya se
+    les pasaron los 30 días, y `funcionaron_cumplidos`, las que funcionaron entre ésas: el
+    porcentaje va con estos dos. Los cuatro son `null` en RESENA (no se sabe) y cuando no se pudo
+    leer con qué se cruzan (`motivos_con_error`).
+    """
+    escritos: int
+    funcionaron: Optional[int] = None
+    en_curso: Optional[int] = None
+    cumplidos: Optional[int] = None
+    funcionaron_cumplidos: Optional[int] = None
+    pospuestos: int
+    descartados: int
+
+
+class SemanaDeMetricas(BaseModel):
+    """Los «le escribí» de una semana, de lunes a domingo, por motivo."""
+    lunes: date
+    control: int
+    presupuesto: int
+    resena: int
+
+
+class MetricasDeContactos(BaseModel):
+    desde: date
+    hasta: date
+    ventana_dias: int
+    control: MetricaDelMotivo
+    presupuesto: MetricaDelMotivo
+    resena: MetricaDelMotivo
+    semanas: list[SemanaDeMetricas]
+    motivos_con_error: list[str]
